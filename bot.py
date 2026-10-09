@@ -1,0 +1,778 @@
+# bot.py
+import random, string, logging, sqlite3, asyncio, os
+from datetime import datetime, timedelta
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
+    ContextTypes, ConversationHandler, MessageHandler, filters)
+import config
+import pterodactyl as pt
+
+logging.basicConfig(level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s")
+log = logging.getLogger(__name__)
+
+CHOOSE_TYPE, ENTER_EMAIL = range(2)
+ADMIN_CHOOSE_TYPE, ADMIN_CHOOSE_RAM, ADMIN_CHOOSE_DISK, ADMIN_CHOOSE_CPU, ADMIN_ENTER_EMAIL = range(20, 25)
+ASK_NEW_PASS = 10
+ASK_EMAIL_FOR_PASS, ASK_PASS_NEW = range(11, 13)
+
+EGGS_CACHE = {}
+ALLOCATION_CACHE = {}
+
+def db():
+    conn = sqlite3.connect(config.DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, username TEXT, first_seen TEXT NOT NULL, trial_used INTEGER NOT NULL DEFAULT 0)")
+    conn.execute("CREATE TABLE IF NOT EXISTS owned_servers (telegram_id INTEGER NOT NULL, server_id INTEGER PRIMARY KEY, panel_user_id INTEGER NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL)")
+    conn.commit()
+    return conn
+
+def register_user(user):
+    conn = db(); conn.execute("INSERT OR IGNORE INTO users(telegram_id, username, first_seen) VALUES (?, ?, ?)", (user.id, user.username or "", datetime.now().isoformat())); conn.execute("UPDATE users SET username=? WHERE telegram_id=?", (user.username or "", user.id)); conn.commit(); conn.close()
+
+def trial_available(uid):
+    conn = db(); row = conn.execute("SELECT trial_used FROM users WHERE telegram_id=?", (uid,)).fetchone(); conn.close(); return not row or not row["trial_used"]
+
+def mark_trial_used(uid):
+    conn = db(); conn.execute("UPDATE users SET trial_used=1 WHERE telegram_id=?", (uid,)); conn.commit(); conn.close()
+
+def save_owned_server(tg_id, server_id, panel_uid, expiry):
+    conn = db(); conn.execute("INSERT OR REPLACE INTO owned_servers VALUES (?, ?, ?, ?, ?)", (tg_id, int(server_id), int(panel_uid), expiry.isoformat(), datetime.now().isoformat())); conn.commit(); conn.close()
+
+def owned_server_ids(tg_id):
+    conn = db(); rows = conn.execute("SELECT server_id FROM owned_servers WHERE telegram_id=?", (tg_id,)).fetchall(); conn.close(); return {int(r["server_id"]) for r in rows}
+
+def owns_server(tg_id, sid):
+    return int(sid) in owned_server_ids(tg_id)
+
+def subscription_text():
+    return f"\n\n{config.SUBSCRIPTION_MESSAGE}"
+
+def main_keyboard(dev=False):
+    rows = [["🖥️ إنشاء سيرفر", "📋 سيرفراتي"], ["✅ حالة البوت", "💳 الاشتراك"]]
+    if dev:
+        rows += [["📊 الإحصائيات", "🗂️ كل السيرفرات"], ["⛔ إيقاف الكل", "▶️ تشغيل الكل"]]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
+
+async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "💳 **الاشتراك بعد انتهاء التجربة**\n\n"
+        f"{config.SUBSCRIPTION_MESSAGE}\n\n"
+        "أرسل للمطور اسم المستخدم أو رقم السيرفر ليتم التجديد.",
+        parse_mode="Markdown", reply_markup=main_keyboard(is_dev(update.effective_user.id)))
+
+def is_dev(uid):
+    return uid == config.DEVELOPER_ID
+
+def rand_pass(n=14):
+    chars = string.ascii_letters + string.digits + "!@#"
+    return "".join(random.choice(chars) for _ in range(n))
+
+def rand_user():
+    return "user" + "".join(random.choices(string.digits, k=6))
+
+def admin_footer():
+    return f"\n\n━━━━━━━━━━━━━━\n{config.BRAND_FOOTER}"
+
+def resource_price(ram, disk, cpu):
+    vals = [ram * config.PRICE_RAM_PER_GB, disk * config.PRICE_DISK_PER_GB, (cpu / 100) * config.PRICE_CPU_PER_100]
+    if any(v == "inf" for v in (ram, disk, cpu)):
+        return config.INFINITE_RESOURCE_PRICE
+    return f"{sum(vals):.2f} {config.PRICE_CURRENCY} / شهر"
+
+def load_eggs():
+    eggs, err = pt.discover_eggs()
+    if err:
+        log.error(f"فشل اكتشاف البيض: {err}")
+        return False
+    EGGS_CACHE.update(eggs)
+    nodes, err = pt.list_nodes()
+    if not err and nodes.get("data"):
+        node_id = nodes["data"][0]["attributes"]["id"]
+        alloc, _ = pt.get_free_allocation(node_id)
+        if alloc:
+            ALLOCATION_CACHE["id"] = alloc
+    log.info(f"✅ البيض: {list(eggs.keys())} | تخصيص: {ALLOCATION_CACHE.get('id')}")
+    return True
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user)
+    if not is_dev(update.effective_user.id):
+        text = (
+            "👋 **مرحباً بك في Arab Code Hosting!**\n\n"
+            "🎁 سيرفر مجاني لأول مرة لمدة 7 أيام.\n"
+            "🖥️ `/create` — إنشاء سيرفر Python أو Node.js\n"
+            "📋 `/servers` — سيرفراتك\n"
+            f"\nبعد انتهاء التجربة: {config.SUBSCRIPTION_MESSAGE}")
+        if os.path.exists(config.BRAND_IMAGE):
+            with open(config.BRAND_IMAGE, "rb") as photo:
+                await update.message.reply_photo(photo=photo, caption=text,
+                    parse_mode="Markdown", reply_markup=main_keyboard(False))
+        else:
+            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=main_keyboard(False))
+        return
+    await update.message.reply_text(
+        "👋 **مرحباً يا مطور!**\n\n"
+        "📦 `/create` — إنشاء سيرفر\n"
+        "📋 `/servers` — قائمة السيرفرات\n"
+        "📊 `/stats` — إحصائيات\n"
+        "🔑 `/chpass` — تغيير باسورد\n"
+        "🔄 `/renew <id>` — تجديد\n"
+        "🧩 `/changegg <id>` — تغيير البيضة\n"
+        "⛔ `/suspendall` — إيقاف الكل\n"
+        "✅ `/unsuspendall` — تشغيل الكل\n"
+        f"ℹ️ `/status` — حالة البوت",
+        parse_mode="Markdown", reply_markup=main_keyboard(True))
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user)
+    if not is_dev(update.effective_user.id):
+        await update.message.reply_text("✅ الخدمة تعمل. استخدم /create لإنشاء سيرفرك المجاني.", reply_markup=main_keyboard(False))
+        return
+    servers, err = pt.list_servers()
+    if err:
+        await update.message.reply_text(f"❌ البانل غير متصل: {err}")
+        return
+    total = servers.get("meta", {}).get("pagination", {}).get("total", 0)
+    eggs_list = ", ".join(EGGS_CACHE.keys()) if EGGS_CACHE else "لم تُكتشف"
+    await update.message.reply_text(
+        f"✅ **البوت يعمل**\n\n🌐 البانل: متصل\n"
+        f"📊 السيرفرات: `{total}`\n🧩 البيض: `{eggs_list}`\n"
+        f"🎯 التخصيص: `{ALLOCATION_CACHE.get('id', '؟')}`\n"
+        f"🕐 {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+        parse_mode="Markdown")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id):
+        return
+    users, e1 = pt.api("GET", "/users")
+    servers, e2 = pt.list_servers()
+    if e1 or e2:
+        await update.message.reply_text("❌ فشل جلب الإحصائيات.")
+        return
+    u = users.get("meta", {}).get("pagination", {}).get("total", 0)
+    s = servers.get("meta", {}).get("pagination", {}).get("total", 0)
+    await update.message.reply_text(
+        f"📊 **إحصائيات:**\n\n👥 المستخدمون: `{u}`\n🖥️ السيرفرات: `{s}`",
+        parse_mode="Markdown")
+
+async def create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user)
+    if is_dev(update.effective_user.id):
+        if not EGGS_CACHE:
+            load_eggs()
+        keyboard = []
+        if "python" in EGGS_CACHE:
+            keyboard.append([InlineKeyboardButton("🐍 Python", callback_data="admin_type_python")])
+        if "node" in EGGS_CACHE:
+            keyboard.append([InlineKeyboardButton("🟢 Node.js 22", callback_data="admin_type_node")])
+        keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="admin_cancel")])
+        await update.message.reply_text("🛠️ **إنشاء سيرفر إداري**\n\nاختر البيضة:",
+            reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        return ADMIN_CHOOSE_TYPE
+    if not is_dev(update.effective_user.id) and not trial_available(update.effective_user.id):
+        await update.message.reply_text("⚠️ لقد استخدمت تجربتك المجانية بالفعل." + subscription_text())
+        return
+    if not EGGS_CACHE:
+        load_eggs()
+    if not EGGS_CACHE:
+        await update.message.reply_text("❌ لم يتم اكتشاف بيض البانل.")
+        return ConversationHandler.END
+    keyboard = []
+    if "python" in EGGS_CACHE:
+        keyboard.append([InlineKeyboardButton("🐍 Python", callback_data="type_python")])
+    if "node" in EGGS_CACHE:
+        keyboard.append([InlineKeyboardButton("🟢 Node.js 22", callback_data="type_node")])
+    keyboard.append([InlineKeyboardButton("❌ إلغاء", callback_data="cancel")])
+    await update.message.reply_text("🧩 **اختر النوع:**",
+        reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    return CHOOSE_TYPE
+
+async def admin_choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "admin_cancel":
+        await q.edit_message_text("❌ تم الإلغاء.")
+        return ConversationHandler.END
+    stype = q.data.replace("admin_type_", "")
+    context.user_data["type"] = stype
+    context.user_data["egg"] = EGGS_CACHE[stype]
+    kb = [[InlineKeyboardButton(f"🟦 {n}G", callback_data=f"admin_ram_{n}") for n in range(1, 4)],
+          [InlineKeyboardButton(f"🟦 {n}G", callback_data=f"admin_ram_{n}") for n in range(4, 6)],
+          [InlineKeyboardButton("♾️ RAM Infinite", callback_data="admin_ram_inf")],
+          [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back_type")]]
+    await q.edit_message_text(f"✅ البيضة: **{stype.upper()}**\n\nاختر RAM:",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    return ADMIN_CHOOSE_RAM
+
+async def admin_choose_ram(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "admin_back_type":
+        kb = [[InlineKeyboardButton("🐍 Python", callback_data="admin_type_python"), InlineKeyboardButton("🟢 Node.js 22", callback_data="admin_type_node")], [InlineKeyboardButton("❌ إلغاء", callback_data="admin_cancel")]]
+        await q.edit_message_text("🛠️ اختر البيضة:", reply_markup=InlineKeyboardMarkup(kb))
+        return ADMIN_CHOOSE_TYPE
+    value = q.data.replace("admin_ram_", "")
+    context.user_data["ram"] = "inf" if value == "inf" else int(value)
+    kb = [[InlineKeyboardButton(f"💿 {n}G", callback_data=f"admin_disk_{n}") for n in range(1, 6)],
+          [InlineKeyboardButton(f"💿 {n}G", callback_data=f"admin_disk_{n}") for n in range(6, 11)],
+          [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back_ram")]]
+    await q.edit_message_text("اختر مساحة التخزين Disk:", reply_markup=InlineKeyboardMarkup(kb))
+    return ADMIN_CHOOSE_DISK
+
+async def admin_choose_disk(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "admin_back_ram":
+        kb = [[InlineKeyboardButton(f"🟦 {n}G", callback_data=f"admin_ram_{n}") for n in range(1, 4)], [InlineKeyboardButton(f"🟦 {n}G", callback_data=f"admin_ram_{n}") for n in range(4, 6)], [InlineKeyboardButton("♾️ RAM Infinite", callback_data="admin_ram_inf")], [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back_type")]]
+        await q.edit_message_text("اختر RAM:", reply_markup=InlineKeyboardMarkup(kb))
+        return ADMIN_CHOOSE_RAM
+    context.user_data["disk"] = int(q.data.replace("admin_disk_", ""))
+    kb = [[InlineKeyboardButton(f"⚡ {n}%", callback_data=f"admin_cpu_{n}") for n in (100, 150, 200)],
+          [InlineKeyboardButton("♾️ CPU Infinite", callback_data="admin_cpu_inf")],
+          [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back_disk")]]
+    await q.edit_message_text("اختر CPU:", reply_markup=InlineKeyboardMarkup(kb))
+    return ADMIN_CHOOSE_CPU
+
+async def admin_choose_cpu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "admin_back_disk":
+        kb = [[InlineKeyboardButton(f"💿 {n}G", callback_data=f"admin_disk_{n}") for n in range(1, 6)], [InlineKeyboardButton(f"💿 {n}G", callback_data=f"admin_disk_{n}") for n in range(6, 11)], [InlineKeyboardButton("🔙 رجوع", callback_data="admin_back_ram")]]
+        await q.edit_message_text("اختر مساحة التخزين Disk:", reply_markup=InlineKeyboardMarkup(kb))
+        return ADMIN_CHOOSE_DISK
+    value = q.data.replace("admin_cpu_", "")
+    context.user_data["cpu"] = "inf" if value == "inf" else int(value)
+    ram, disk, cpu = context.user_data["ram"], context.user_data["disk"], context.user_data["cpu"]
+    await q.edit_message_text(
+        f"📦 الموارد المختارة:\nRAM: `{ram if ram != 'inf' else 'Infinite'}`\n"
+        f"Disk: `{disk}G`\nCPU: `{cpu if cpu != 'inf' else 'Infinite'}`\n"
+        f"💰 السعر المبدئي: `{resource_price(ram, disk, cpu)}`\n\n"
+        "أرسل إيميل المستخدم أو اسم المستخدم (سيضاف @arab-code.cv تلقائيًا):",
+        parse_mode="Markdown")
+    return ADMIN_ENTER_EMAIL
+
+async def admin_receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user)
+    email = update.message.text.strip()
+    if "@" not in email:
+        email = f"{email}@arab-code.cv"
+    existing, _ = pt.find_user_by_email(email)
+    if existing:
+        await update.message.reply_text("⚠️ الإيميل مستخدم بالفعل. أرسل اسمًا آخر:")
+        return ADMIN_ENTER_EMAIL
+    password, username = rand_pass(), rand_user()
+    egg, stype = context.user_data["egg"], context.user_data["type"]
+    ram, disk, cpu = context.user_data["ram"], context.user_data["disk"], context.user_data["cpu"]
+    msg = await update.message.reply_text("⏳ جاري إنشاء السيرفر الإداري...")
+    uid, err = pt.create_user(email, username, password)
+    if err:
+        await msg.edit_text(f"❌ فشل إنشاء المستخدم: {err}")
+        return ConversationHandler.END
+    is_py = stype == "python"
+    env = pt.build_environment(egg, is_py)
+    alloc_id, err = pt.get_free_allocation(1)
+    if err:
+        pt.delete_user(uid); await msg.edit_text(f"❌ لا يوجد تخصيص: {err}"); return ConversationHandler.END
+    limits = {"memory": 0 if ram == "inf" else ram * 1024, "swap": 0,
+              "disk": disk * 1024, "io": 500, "cpu": 0 if cpu == "inf" else cpu}
+    server, err = pt.create_server(uid, egg["id"], f"{username}-srv",
+        config.DOCKER_PYTHON if is_py else config.DOCKER_NODE,
+        egg.get("startup") or (config.STARTUP_PYTHON if is_py else config.STARTUP_NODE),
+        env, alloc_id, limits=limits)
+    if err:
+        pt.delete_user(uid); await msg.edit_text(f"❌ فشل إنشاء السيرفر: {err}"); return ConversationHandler.END
+    sid = server["id"]
+    expiry = datetime.now() + timedelta(days=config.ADMIN_SERVER_DURATION_DAYS)
+    save_owned_server(update.effective_user.id, sid, uid, expiry)
+    pt.update_server_details(sid, {"description": f"expires_at={expiry.isoformat()}", "external_id": expiry.isoformat()})
+    invoice = ("🧾 **فاتورة إنشاء سيرفر**\n\n"
+        f"🆔 رقم السيرفر: `{sid}`\n📧 الحساب: `{email}`\n🔑 كلمة المرور: `{password}`\n"
+        f"👤 اسم المستخدم: `{username}`\n🧩 البيضة: `{stype.upper()}`\n\n"
+        f"💾 RAM: `{ram if ram != 'inf' else 'Infinite'}`\n💿 Disk: `{disk}G`\n"
+        f"⚡ CPU: `{cpu if cpu != 'inf' else 'Infinite'}`\n"
+        f"💰 السعر: `{resource_price(ram, disk, cpu)}`\n📅 الصلاحية حتى: `{expiry.strftime('%Y-%m-%d')}`"
+        f"{admin_footer()}")
+    await msg.edit_text(invoice, parse_mode="Markdown")
+    return ConversationHandler.END
+
+async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    if q.data == "cancel":
+        await q.edit_message_text("❌ تم الإلغاء.")
+        return ConversationHandler.END
+    stype = q.data.replace("type_", "")
+    context.user_data["type"] = stype
+    context.user_data["egg"] = EGGS_CACHE[stype]
+    await q.edit_message_text(
+        f"✅ النوع: **{stype.upper()}**\n\n📧 **أدخل الإيميل:**\n"
+        "(سيضاف `@arab-code.cv` تلقائياً)\n\n/cancel للإلغاء",
+        parse_mode="Markdown")
+    return ENTER_EMAIL
+
+async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user)
+    email = update.message.text.strip()
+    if "@" not in email:
+        email = f"{email}@arab-code.cv"
+    existing, _ = pt.find_user_by_email(email)
+    if existing:
+        await update.message.reply_text("⚠️ الإيميل مستخدم.")
+        return ENTER_EMAIL
+    password = rand_pass()
+    username = rand_user()
+    stype = context.user_data["type"]
+    egg = context.user_data["egg"]
+    msg = await update.message.reply_text("⏳ جاري الإنشاء...")
+    uid, err = pt.create_user(email, username, password)
+    if err:
+        await msg.edit_text(f"❌ فشل إنشاء المستخدم: {err}")
+        return ConversationHandler.END
+    is_py = (stype == "python")
+    docker = config.DOCKER_PYTHON if is_py else config.DOCKER_NODE
+    startup = egg.get("startup") or (config.STARTUP_PYTHON if is_py else config.STARTUP_NODE)
+    env = pt.build_environment(egg, is_py)
+    # Always ask Wings for a fresh free allocation; cached allocations become
+    # assigned after the first server and can cause misleading create errors.
+    alloc_id, err = pt.get_free_allocation(1)
+    if err:
+        pt.delete_user(uid)
+        await msg.edit_text(f"❌ لا يوجد تخصيص متاح: {err}")
+        return ConversationHandler.END
+    server, err = pt.create_server(uid, egg["id"], f"{username}-srv",
+        docker, startup, env, alloc_id)
+    if err and ("[404]" in err or "[409]" in err or "allocation" in err.lower()):
+        # A stale allocation or a transient Wings response should not consume
+        # the user's trial. Fetch another free allocation and retry once.
+        fresh_alloc, alloc_err = pt.get_free_allocation(1)
+        if fresh_alloc and fresh_alloc != alloc_id:
+            server, err = pt.create_server(uid, egg["id"], f"{username}-srv",
+                docker, startup, env, fresh_alloc)
+    if err:
+        pt.delete_user(uid)
+        await msg.edit_text(f"❌ فشل إنشاء السيرفر: {err}")
+        return ConversationHandler.END
+    sid = server["id"]
+    expiry = datetime.now() + timedelta(days=config.SERVER_DURATION_DAYS)
+    save_owned_server(update.effective_user.id, sid, uid, expiry)
+    if not is_dev(update.effective_user.id):
+        mark_trial_used(update.effective_user.id)
+    pt.update_server_details(sid, {
+        "description": f"expires_at={expiry.isoformat()}",
+        "external_id": expiry.isoformat()})
+    await msg.edit_text(
+        f"✅ **تم إنشاء السيرفر!**\n\n📧 `{email}`\n🔑 `{password}`\n"
+        f"👤 `{username}`\n\n🌐 {config.PANEL_URL}\n🆔 `{sid}`\n"
+        f"🧩 {stype.upper()}\n⏳ {config.SERVER_DURATION_DAYS} أيام\n"
+        f"📅 {expiry.strftime('%Y-%m-%d %H:%M')}\n\n⚠️ احفظ البيانات!",
+        parse_mode="Markdown")
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ تم الإلغاء.")
+    return ConversationHandler.END
+
+async def servers_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user)
+    if is_dev(update.effective_user.id):
+        await _show_servers(update, 0)
+        return
+    ids = owned_server_ids(update.effective_user.id)
+    if not ids:
+        await update.message.reply_text("📭 لا توجد سيرفرات لك. استخدم /create للبدء.")
+        return
+    lines, kb = ["📋 **سيرفراتك:**\n"], []
+    for sid in sorted(ids):
+        srv, err = pt.get_server(sid)
+        if err or not srv: continue
+        a = srv["attributes"]; icon = "⛔" if a.get("suspended") else "✅"
+        lines.append(f"{icon} `{sid}` — {a['name']}")
+        kb.append([InlineKeyboardButton(f"⚙️ {a['name']}", callback_data=f"mng_{sid}")])
+    await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+async def _show_servers(update, page=0):
+    res, err = pt.list_servers()
+    target = update.callback_query.message if update.callback_query else update.message
+    if err:
+        await target.reply_text(f"❌ {err}")
+        return
+    data = res.get("data", [])
+    if not data:
+        await target.reply_text("📭 لا توجد سيرفرات.")
+        return
+    PER = 8
+    start = page * PER
+    chunk = data[start:start + PER]
+    text = f"📋 **السيرفرات** ({len(data)}) — صفحة {page+1}\n\n"
+    kb = []
+    for s in chunk:
+        a = s["attributes"]
+        icon = "⛔" if a.get("suspended") else "✅"
+        text += f"{icon} `{a['id']}` — {a['name']}\n"
+        kb.append([InlineKeyboardButton(f"⚙️ {a['name']}", callback_data=f"mng_{a['id']}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️", callback_data=f"pg_{page-1}"))
+    if start + PER < len(data):
+        nav.append(InlineKeyboardButton("➡️", callback_data=f"pg_{page+1}"))
+    if nav:
+        kb.append(nav)
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text,
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    else:
+        await update.message.reply_text(text,
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+async def paginate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await _show_servers(update, int(q.data.split("_")[1]))
+
+async def manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    sid = q.data.split("_")[1]
+    if not is_dev(update.effective_user.id) and not owns_server(update.effective_user.id, sid):
+        await q.edit_message_text("⛔ هذا السيرفر ليس تابعاً لحسابك.")
+        return
+    srv, err = pt.get_server(sid)
+    if err:
+        await q.edit_message_text(f"❌ {err}")
+        return
+    a = srv["attributes"]
+    desc = a.get("description", "") or ""
+    expiry = "غير معروف"
+    if "expires_at=" in desc:
+        try:
+            expiry = desc.split("expires_at=")[1].split(" ")[0][:16].replace("T", " ")
+        except Exception:
+            pass
+    text = (f"⚙️ **إدارة:** {a['name']}\n\n🆔 `{sid}`\n"
+        f"🧩 البيضة: `{a.get('egg')}`\n💾 RAM: `{a['limits']['memory']} MB`\n"
+        f"💿 Disk: `{a['limits']['disk']} MB`\n⚡ CPU: `{a['limits']['cpu']}%`\n"
+        f"📅 الانتهاء: `{expiry}`\n⛔ معلق: `{a.get('suspended', False)}`")
+    if not is_dev(update.effective_user.id):
+        kb = [[InlineKeyboardButton("⏹ إيقاف", callback_data=f"act_suspend_{sid}"), InlineKeyboardButton("▶️ تشغيل", callback_data=f"act_unsuspend_{sid}")],
+              [InlineKeyboardButton("🔄 إعادة تثبيت", callback_data=f"act_reinstall_{sid}"), InlineKeyboardButton("📊 الموارد", callback_data=f"act_res_{sid}")],
+              [InlineKeyboardButton("🔙 رجوع", callback_data="back_servers")]]
+        await q.edit_message_text(text + subscription_text(), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return
+    kb = [
+        [InlineKeyboardButton("⏹ إيقاف", callback_data=f"act_suspend_{sid}"),
+         InlineKeyboardButton("▶️ تشغيل", callback_data=f"act_unsuspend_{sid}")],
+        [InlineKeyboardButton("🔄 إعادة تثبيت", callback_data=f"act_reinstall_{sid}"),
+         InlineKeyboardButton("⏳ تجديد", callback_data=f"act_renew_{sid}")],
+        [InlineKeyboardButton("🧩 تغيير البيضة", callback_data=f"act_chegg_{sid}"),
+         InlineKeyboardButton("🔑 تغيير الباسورد", callback_data=f"act_chpass_{sid}")],
+        [InlineKeyboardButton("📊 الموارد", callback_data=f"act_res_{sid}"),
+         InlineKeyboardButton("🗑 حذف", callback_data=f"act_del_{sid}")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back_servers")],
+    ]
+    await q.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb),
+        parse_mode="Markdown")
+
+async def server_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    parts = q.data.split("_", 2)
+    action, sid = parts[1], parts[2]
+    if action != "res":
+        await q.answer()
+    if not is_dev(update.effective_user.id) and not owns_server(update.effective_user.id, sid):
+        await q.answer("⛔ هذا السيرفر ليس تابعاً لك", show_alert=True)
+        return
+
+    if action == "suspend":
+        _, err = pt.suspend_server(sid)
+        await q.answer("✅ تم الإيقاف" if not err else f"❌ {err}", show_alert=True)
+    elif action == "unsuspend":
+        _, err = pt.unsuspend_server(sid)
+        await q.answer("✅ تم التشغيل" if not err else f"❌ {err}", show_alert=True)
+    elif action == "reinstall":
+        _, err = pt.reinstall_server(sid)
+        await q.answer("✅ تم الإرسال" if not err else f"❌ {err}", show_alert=True)
+    elif action == "renew":
+        expiry = datetime.now() + timedelta(days=config.SERVER_DURATION_DAYS)
+        pt.update_server_details(sid, {
+            "description": f"expires_at={expiry.isoformat()}",
+            "external_id": expiry.isoformat()})
+        pt.unsuspend_server(sid)
+        await q.edit_message_text(
+            f"✅ **تم التجديد!**\n🆔 `{sid}`\n📅 `{expiry.strftime('%Y-%m-%d %H:%M')}`",
+            parse_mode="Markdown")
+        return
+    elif action == "res":
+        srv, err = pt.get_server(sid)
+        if err:
+            await q.answer(f"❌ {err}", show_alert=True)
+            return
+        a = srv["attributes"]
+        await q.answer(f"💾 RAM: {a['limits']['memory']} MB\n"
+            f"💿 Disk: {a['limits']['disk']} MB\n"
+            f"⚡ CPU: {a['limits']['cpu']}%", show_alert=True)
+        return
+    elif action == "chegg":
+        kb = []
+        if "python" in EGGS_CACHE:
+            kb.append([InlineKeyboardButton("🐍 Python", callback_data=f"setegg_{sid}_python")])
+        if "node" in EGGS_CACHE:
+            kb.append([InlineKeyboardButton("🟢 Node.js 22", callback_data=f"setegg_{sid}_node")])
+        kb.append([InlineKeyboardButton("🔙 رجوع", callback_data=f"mng_{sid}")])
+        await q.edit_message_text("🧩 **اختر البيضة الجديدة:**\n⚠️ سيُعاد التثبيت وتُحذف الملفات!",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return
+    elif action == "chpass":
+        context.user_data["chpass_sid"] = sid
+        await q.edit_message_text("🔑 **أرسل كلمة المرور الجديدة:**\n(6+ أحرف)\n\n/cancel للإلغاء")
+        return ASK_NEW_PASS
+    elif action == "del":
+        kb = [[InlineKeyboardButton("✅ نعم", callback_data=f"confdel_{sid}"),
+               InlineKeyboardButton("❌ لا", callback_data=f"mng_{sid}")]]
+        await q.edit_message_text(f"⚠️ **تأكيد حذف `{sid}`؟**\nسيُحذف نهائياً!",
+            reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        return
+    await manage(update, context)
+
+async def set_egg_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    _, sid, stype = q.data.split("_", 2)
+    egg = EGGS_CACHE.get(stype)
+    if not egg:
+        await q.edit_message_text("❌ البيضة غير متوفرة.")
+        return
+    is_py = (stype == "python")
+    docker = config.DOCKER_PYTHON if is_py else config.DOCKER_NODE
+    startup = egg.get("startup") or (config.STARTUP_PYTHON if is_py else config.STARTUP_NODE)
+    env = pt.build_environment(egg, is_py)
+    _, err = pt.update_server_build(sid, {"egg": egg["id"],
+        "docker_image": docker, "startup": startup, "environment": env})
+    if err:
+        await q.edit_message_text(f"❌ {err}")
+        return
+    pt.reinstall_server(sid)
+    await q.edit_message_text(
+        f"✅ **تم تغيير البيضة إلى {stype.upper()}!**\n🔄 جاري إعادة التثبيت...",
+        parse_mode="Markdown")
+
+async def receive_new_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pwd = update.message.text.strip()
+    if len(pwd) < 6:
+        await update.message.reply_text("❌ قصيرة!")
+        return ASK_NEW_PASS
+    sid = context.user_data.get("chpass_sid")
+    srv, err = pt.get_server(sid)
+    if err:
+        await update.message.reply_text(f"❌ {err}")
+        return ConversationHandler.END
+    uid = srv["attributes"]["user"]
+    if isinstance(uid, dict):
+        uid = uid["id"]
+    _, err = pt.update_user(uid, {"password": pwd})
+    if err:
+        await update.message.reply_text(f"❌ {err}")
+    else:
+        await update.message.reply_text(f"✅ **تم التغيير!**\n\n🔑 `{pwd}`",
+            parse_mode="Markdown")
+    return ConversationHandler.END
+
+async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    sid = q.data.split("_")[1]
+    _, err = pt.delete_server(sid)
+    if err:
+        await q.edit_message_text(f"❌ {err}")
+    else:
+        await q.edit_message_text(f"✅ تم حذف `{sid}`.", parse_mode="Markdown")
+
+async def back_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    await _show_servers(update, 0)
+
+async def chpass_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id):
+        return
+    await update.message.reply_text("📧 أرسل إيميل المستخدم:")
+    return ASK_EMAIL_FOR_PASS
+
+async def receive_email_for_pass(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    email = update.message.text.strip()
+    user, err = pt.find_user_by_email(email)
+    if err:
+        await update.message.reply_text(f"❌ {err}")
+        return ConversationHandler.END
+    context.user_data["pass_uid"] = user["id"]
+    context.user_data["pass_email"] = email
+    await update.message.reply_text("🔑 أرسل كلمة المرور الجديدة:")
+    return ASK_PASS_NEW
+
+async def receive_pass_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pwd = update.message.text.strip()
+    if len(pwd) < 6:
+        await update.message.reply_text("❌ قصيرة!")
+        return ASK_PASS_NEW
+    uid = context.user_data["pass_uid"]
+    email = context.user_data["pass_email"]
+    _, err = pt.update_user(uid, {"password": pwd})
+    if err:
+        await update.message.reply_text(f"❌ {err}")
+    else:
+        await update.message.reply_text(f"✅ تم!\n📧 `{email}`\n🔑 `{pwd}`",
+            parse_mode="Markdown")
+    return ConversationHandler.END
+
+async def renew_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("`/renew <server_id>`", parse_mode="Markdown")
+        return
+    sid = context.args[0]
+    expiry = datetime.now() + timedelta(days=config.SERVER_DURATION_DAYS)
+    _, err = pt.update_server_details(sid, {
+        "description": f"expires_at={expiry.isoformat()}",
+        "external_id": expiry.isoformat()})
+    if err:
+        await update.message.reply_text(f"❌ {err}")
+        return
+    pt.unsuspend_server(sid)
+    await update.message.reply_text(
+        f"✅ تم التجديد حتى `{expiry.strftime('%Y-%m-%d %H:%M')}`", parse_mode="Markdown")
+
+async def changegg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("`/changegg <server_id>`", parse_mode="Markdown")
+        return
+    sid = context.args[0]
+    kb = []
+    if "python" in EGGS_CACHE:
+        kb.append([InlineKeyboardButton("🐍 Python", callback_data=f"setegg_{sid}_python")])
+    if "node" in EGGS_CACHE:
+        kb.append([InlineKeyboardButton("🟢 Node.js 22", callback_data=f"setegg_{sid}_node")])
+    await update.message.reply_text(f"🧩 اختر البيضة للسيرفر `{sid}`:",
+        reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+async def suspend_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id):
+        return
+    servers, err = pt.list_servers()
+    if err:
+        await update.message.reply_text(f"❌ {err}")
+        return
+    ok = bad = 0
+    for s in servers.get("data", []):
+        _, e = pt.suspend_server(s["attributes"]["id"])
+        if e:
+            bad += 1
+        else:
+            ok += 1
+    await update.message.reply_text(f"⛔ تم — ✅ {ok} | ❌ {bad}")
+
+async def unsuspend_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id):
+        return
+    servers, err = pt.list_servers()
+    if err:
+        await update.message.reply_text(f"❌ {err}")
+        return
+    ok = bad = 0
+    for s in servers.get("data", []):
+        _, e = pt.unsuspend_server(s["attributes"]["id"])
+        if e:
+            bad += 1
+        else:
+            ok += 1
+    await update.message.reply_text(f"▶️ تم — ✅ {ok} | ❌ {bad}")
+
+async def expiry_loop():
+    while True:
+        try:
+            conn = db(); rows = conn.execute("SELECT server_id, expires_at FROM owned_servers").fetchall(); conn.close()
+            now = datetime.now()
+            for row in rows:
+                try:
+                    if datetime.fromisoformat(row["expires_at"]) <= now:
+                        _, err = pt.suspend_server(row["server_id"])
+                        if not err: log.info("⏳ تم إيقاف السيرفر المنتهي %s", row["server_id"])
+                except Exception as exc:
+                    log.error("expiry check failed for %s: %s", row["server_id"], exc)
+        except Exception as exc:
+            log.error("expiry loop failed: %s", exc)
+        await asyncio.sleep(config.TRIAL_CHECK_INTERVAL_SECONDS)
+
+async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    routes = {
+        "🖥️ إنشاء سيرفر": create_start,
+        "📋 سيرفراتي": servers_list,
+        "✅ حالة البوت": status,
+        "💳 الاشتراك": subscribe_cmd,
+        "📊 الإحصائيات": stats,
+        "🗂️ كل السيرفرات": servers_list,
+        "⛔ إيقاف الكل": suspend_all,
+        "▶️ تشغيل الكل": unsuspend_all,
+    }
+    handler = routes.get(update.message.text)
+    if handler:
+        await handler(update, context)
+
+def main():
+    db()
+    if not load_eggs():
+        log.warning("⚠️ فشل اكتشاف البيض — ستُعاد عند /create")
+    app = Application.builder().token(config.BOT_TOKEN).build()
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("create", create_start),
+                      MessageHandler(filters.Regex("^🖥️ إنشاء سيرفر$"), create_start)],
+        states={CHOOSE_TYPE: [CallbackQueryHandler(choose_type, pattern="^(type_|cancel)")],
+                ENTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_email)],
+                ADMIN_CHOOSE_TYPE: [CallbackQueryHandler(admin_choose_type, pattern="^admin_(type_|cancel)")],
+                ADMIN_CHOOSE_RAM: [CallbackQueryHandler(admin_choose_ram, pattern="^admin_(ram_|back_type)")],
+                ADMIN_CHOOSE_DISK: [CallbackQueryHandler(admin_choose_disk, pattern="^admin_(disk_|back_ram)")],
+                ADMIN_CHOOSE_CPU: [CallbackQueryHandler(admin_choose_cpu, pattern="^admin_(cpu_|back_disk)")],
+                ADMIN_ENTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_receive_email)]},
+        fallbacks=[CommandHandler("cancel", cancel)]))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("chpass", chpass_cmd)],
+        states={ASK_EMAIL_FOR_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_email_for_pass)],
+                ASK_PASS_NEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_pass_new)]},
+        fallbacks=[CommandHandler("cancel", cancel)]))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(server_action, pattern="^act_chpass_")],
+        states={ASK_NEW_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_pass)]},
+        fallbacks=[CommandHandler("cancel", cancel)]))
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(CommandHandler("subscribe", subscribe_cmd))
+    app.add_handler(CommandHandler("stats", stats))
+    app.add_handler(CommandHandler("servers", servers_list))
+    app.add_handler(CommandHandler("renew", renew_cmd))
+    app.add_handler(CommandHandler("changegg", changegg_cmd))
+    app.add_handler(CommandHandler("suspendall", suspend_all))
+    app.add_handler(CommandHandler("unsuspendall", unsuspend_all))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(🖥️ إنشاء سيرفر|📋 سيرفراتي|✅ حالة البوت|💳 الاشتراك|📊 الإحصائيات|🗂️ كل السيرفرات|⛔ إيقاف الكل|▶️ تشغيل الكل)$"), menu_router))
+    app.add_handler(CallbackQueryHandler(paginate, pattern="^pg_"))
+    app.add_handler(CallbackQueryHandler(manage, pattern="^mng_"))
+    app.add_handler(CallbackQueryHandler(set_egg_cb, pattern="^setegg_"))
+    app.add_handler(CallbackQueryHandler(confirm_delete, pattern="^confdel_"))
+    app.add_handler(CallbackQueryHandler(back_servers, pattern="^back_servers$"))
+    app.add_handler(CallbackQueryHandler(server_action, pattern="^act_"))
+    async def after_start(application):
+        await application.bot.set_my_commands([
+            ("start", "القائمة الرئيسية"),
+            ("create", "إنشاء سيرفر مجاني"),
+            ("servers", "سيرفراتي"),
+            ("status", "حالة البوت"),
+            ("subscribe", "الاشتراك والتجديد"),
+        ])
+        asyncio.create_task(expiry_loop())
+    app.post_init = after_start
+    log.info("🤖 البوت يعمل...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()
