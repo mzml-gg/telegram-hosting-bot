@@ -7,6 +7,7 @@
 <img src="assets/eagle.jpg" alt="Arab Code Hosting eagle logo" width="180" />
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![CI](https://github.com/mzml-gg/telegram-hosting-bot/actions/workflows/python-app.yml/badge.svg)](https://github.com/mzml-gg/telegram-hosting-bot/actions/workflows/python-app.yml)
 [![Telegram](https://img.shields.io/badge/Telegram-Bot_API-26A5E4?logo=telegram&logoColor=white)](https://core.telegram.org/bots/api)
 [![Pterodactyl](https://img.shields.io/badge/Pterodactyl-Application_API-6f42c1)](https://pterodactyl.io/)
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
