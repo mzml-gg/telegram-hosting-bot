@@ -6,13 +6,14 @@ servers expiring within BACKUP_WINDOW_HOURS, and sends a Telegram notification
 to the configured developer. Telegram's Bot API document limit is respected.
 """
 import json, os, sqlite3, subprocess, tempfile, urllib.parse, urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 ENV_FILE = os.getenv("BACKUP_ENV_FILE", "/etc/arab-code-hosting-backup.env")
 VOLUME_ROOT = os.getenv("PTERO_VOLUME_ROOT", "/var/lib/pterodactyl/volumes")
 BACKUP_ROOT = os.getenv("BACKUP_ROOT", "/var/backups/arab-code-hosting")
 DB_PATH = os.getenv("BOT_DB_PATH", "/var/lib/pterodactyl/volumes/BOT_SERVER_UUID/hosting_bot.sqlite3")
 WINDOW_HOURS = int(os.getenv("BACKUP_WINDOW_HOURS", "30"))
+GRACE_HOURS = int(os.getenv("BACKUP_GRACE_HOURS", "1"))
 MAX_TELEGRAM_BYTES = 49 * 1024 * 1024
 
 
@@ -55,41 +56,61 @@ def main():
     env=load_env(ENV_FILE)
     for key in ("BOT_TOKEN","APPLICATION_API_KEY","PANEL_URL","DEVELOPER_ID"):
         if not env.get(key): raise SystemExit(f"missing {key}")
-    os.makedirs(BACKUP_ROOT, exist_ok=True)
-    conn=sqlite3.connect(DB_PATH); conn.row_factory=sqlite3.Row
+    volume_root=env.get("PTERO_VOLUME_ROOT", VOLUME_ROOT)
+    backup_root=env.get("BACKUP_ROOT", BACKUP_ROOT)
+    db_path=env.get("BOT_DB_PATH", DB_PATH)
+    os.makedirs(backup_root, exist_ok=True)
+    conn=sqlite3.connect(db_path); conn.row_factory=sqlite3.Row
+    conn.execute("CREATE TABLE IF NOT EXISTS backup_requests (server_id INTEGER PRIMARY KEY, requested_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending')")
+    for col in ("expires_at_snapshot", "archive_path"):
+        try: conn.execute(f"ALTER TABLE backup_requests ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError: pass
+    conn.commit()
     rows=conn.execute("SELECT server_id,telegram_id,expires_at FROM owned_servers").fetchall()
     now=datetime.now(); cutoff=now.timestamp()+WINDOW_HOURS*3600
     for row in rows:
         try: expiry=datetime.fromisoformat(row["expires_at"])
         except Exception: continue
-        if expiry.timestamp() > cutoff or expiry.timestamp() < now.timestamp()-86400*2: continue
-        req=conn.execute("SELECT status FROM backup_requests WHERE server_id=?",(row["server_id"],)).fetchone()
+        req=conn.execute("SELECT * FROM backup_requests WHERE server_id=?",(row["server_id"],)).fetchone()
         if req and req["status"] == "sent": continue
+        # A renewal after preparation cancels the pending archive.
+        if req and req["status"] == "prepared":
+            try: snapshot=datetime.fromisoformat(req["expires_at_snapshot"])
+            except Exception: snapshot=expiry
+            if expiry > snapshot + timedelta(minutes=1):
+                if req["archive_path"] and os.path.exists(req["archive_path"]): os.remove(req["archive_path"])
+                conn.execute("UPDATE backup_requests SET status=?,archive_path=NULL WHERE server_id=?",("cancelled_renewed",row["server_id"])); conn.commit(); continue
+            if now.timestamp() < snapshot.timestamp() + GRACE_HOURS*3600: continue
+            archive=req["archive_path"]
+            if not archive or not os.path.exists(archive):
+                conn.execute("UPDATE backup_requests SET status=? WHERE server_id=?",("error:prepared archive missing",row["server_id"])); conn.commit(); continue
+            size=os.path.getsize(archive)
+            caption=(f"📦 Backup after non-renewal\nServer: {row['server_id']}\nOwner Telegram ID: {row['telegram_id']}\n"
+                     f"Expired: {row['expires_at']}\nSize: {size/1024/1024:.1f} MB")
+            try:
+                if size <= MAX_TELEGRAM_BYTES:
+                    telegram(env,"sendDocument",{"chat_id":env["DEVELOPER_ID"],"caption":caption},archive); status="sent"
+                else:
+                    telegram(env,"sendMessage",{"chat_id":env["DEVELOPER_ID"],"text":caption+"\n⚠️ File exceeds Telegram's 49 MB upload limit; it remains on the VPS."}); status="stored_large"
+                conn.execute("UPDATE backup_requests SET status=? WHERE server_id=?",(status,row["server_id"])); conn.commit()
+            except Exception as exc:
+                conn.execute("UPDATE backup_requests SET status=? WHERE server_id=?",(f"error:{str(exc)[:160]}",row["server_id"])); conn.commit()
+            continue
+        # Prepare an archive when the server is near expiry, but do not send it yet.
+        if expiry.timestamp() > cutoff or expiry.timestamp() < now.timestamp()-86400*2: continue
         try:
             attrs=panel_get(env,f"/servers/{row['server_id']}")["attributes"]
-            uuid=attrs["uuid"]
-            volume=os.path.join(VOLUME_ROOT,uuid)
+            volume=os.path.join(volume_root,attrs["uuid"])
             if not os.path.isdir(volume): raise RuntimeError("volume not found")
             stamp=datetime.now().strftime("%Y%m%d-%H%M%S")
-            archive=os.path.join(BACKUP_ROOT,f"server-{row['server_id']}-{stamp}.tar.gz")
+            archive=os.path.join(backup_root,f"server-{row['server_id']}-{stamp}.tar.gz")
             subprocess.run(["tar","-czf",archive,"-C",volume,"."],check=True,timeout=900)
-            size=os.path.getsize(archive)
-            caption=(f"📦 Backup before expiry\nServer: {row['server_id']}\n"
-                     f"Owner Telegram ID: {row['telegram_id']}\nExpires: {row['expires_at']}\n"
-                     f"Size: {size/1024/1024:.1f} MB")
-            target=env["DEVELOPER_ID"]
-            if size <= MAX_TELEGRAM_BYTES:
-                telegram(env,"sendDocument",{"chat_id":target,"caption":caption},archive)
-                status="sent"
-            else:
-                telegram(env,"sendMessage",{"chat_id":target,"text":caption+"\n⚠️ File exceeds Telegram's 49 MB upload limit; it remains on the VPS."})
-                status="stored_large"
-            conn.execute("INSERT INTO backup_requests(server_id,requested_at,status) VALUES(?,?,?) ON CONFLICT(server_id) DO UPDATE SET requested_at=excluded.requested_at,status=excluded.status",(row["server_id"],datetime.now().isoformat(),status)); conn.commit()
-            try: telegram(env,"sendMessage",{"chat_id":row["telegram_id"],"text":f"📦 تم تجهيز نسخة احتياطية لسيرفرك {row['server_id']} قبل الانتهاء. تواصل مع المطور للتجديد."})
+            conn.execute("INSERT INTO backup_requests(server_id,requested_at,status,expires_at_snapshot,archive_path) VALUES(?,?,?,?,?) ON CONFLICT(server_id) DO UPDATE SET requested_at=excluded.requested_at,status=excluded.status,expires_at_snapshot=excluded.expires_at_snapshot,archive_path=excluded.archive_path",(row["server_id"],datetime.now().isoformat(),"prepared",row["expires_at"],archive)); conn.commit()
+            try: telegram(env,"sendMessage",{"chat_id":env["DEVELOPER_ID"],"text":f"📦 تم تجهيز نسخة مؤقتة للسيرفر {row['server_id']}. سيتم إرسالها بعد الانتهاء إذا لم يتم التجديد."})
             except Exception: pass
         except Exception as exc:
-            conn.execute("UPDATE backup_requests SET status=? WHERE server_id=?",(f"error:{str(exc)[:160]}",row["server_id"])); conn.commit()
-            try: telegram(env,"sendMessage",{"chat_id":env["DEVELOPER_ID"],"text":f"❌ Backup failed for server {row['server_id']}: {exc}"})
+            conn.execute("INSERT INTO backup_requests(server_id,requested_at,status) VALUES(?,?,?) ON CONFLICT(server_id) DO UPDATE SET requested_at=excluded.requested_at,status=excluded.status",(row["server_id"],datetime.now().isoformat(),f"error:{str(exc)[:160]}")); conn.commit()
+            try: telegram(env,"sendMessage",{"chat_id":env["DEVELOPER_ID"],"text":f"❌ Backup preparation failed for server {row['server_id']}: {exc}"})
             except Exception: pass
     conn.close()
 
