@@ -29,7 +29,7 @@ ADMIN_SERVER_DURATION_DAYS = int(env("ADMIN_SERVER_DURATION_DAYS", "30"))
 DB_PATH = env("DB_PATH", "hosting_bot.sqlite3")
 SUBSCRIPTION_MESSAGE = env(
     "SUBSCRIPTION_MESSAGE",
-    "For subscription after the trial, contact @Monte_dev_md",
+    "💳 الاشتراك بعد انتهاء التجربة\n\nFor subscription after the trial, contact @Monte_dev_md\n\nأرسل للمطور اسم المستخدم أو رقم السيرفر ليتم التجديد.\n\nاليوزر الصحيح: @Monte_dev_md",
 )
 BRAND_IMAGE = env("BRAND_IMAGE", "eagle.jpg")
 TRIAL_MEMORY_MB = int(env("TRIAL_MEMORY_MB", "1024"))

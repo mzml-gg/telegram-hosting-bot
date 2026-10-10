@@ -28,11 +28,17 @@ def db():
     conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     conn.execute("CREATE TABLE IF NOT EXISTS notification_log (telegram_id INTEGER, server_id INTEGER, day TEXT, PRIMARY KEY(telegram_id, server_id, day))")
     conn.execute("CREATE TABLE IF NOT EXISTS backup_requests (server_id INTEGER PRIMARY KEY, requested_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending')")
+    conn.execute("CREATE TABLE IF NOT EXISTS wallets (telegram_id INTEGER PRIMARY KEY, points INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS points_ledger (id INTEGER PRIMARY KEY AUTOINCREMENT, telegram_id INTEGER NOT NULL, delta INTEGER NOT NULL, kind TEXT NOT NULL, reference TEXT, created_at TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS referrals (referred_id INTEGER PRIMARY KEY, referrer_id INTEGER NOT NULL, reward_granted INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS gift_codes (code TEXT PRIMARY KEY, points INTEGER NOT NULL, max_uses INTEGER NOT NULL, uses INTEGER NOT NULL DEFAULT 0, expires_at TEXT NOT NULL, created_by INTEGER NOT NULL, created_at TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS gift_redemptions (code TEXT NOT NULL, telegram_id INTEGER NOT NULL, redeemed_at TEXT NOT NULL, PRIMARY KEY(code, telegram_id))")
+    conn.execute("INSERT OR IGNORE INTO wallets(telegram_id, points, updated_at) SELECT telegram_id, 0, ? FROM users", (datetime.now().isoformat(),))
     conn.commit()
     return conn
 
 def register_user(user):
-    conn = db(); conn.execute("INSERT OR IGNORE INTO users(telegram_id, username, first_seen) VALUES (?, ?, ?)", (user.id, user.username or "", datetime.now().isoformat())); conn.execute("UPDATE users SET username=? WHERE telegram_id=?", (user.username or "", user.id)); conn.commit(); conn.close()
+    conn = db(); now=datetime.now().isoformat(); conn.execute("INSERT OR IGNORE INTO users(telegram_id, username, first_seen) VALUES (?, ?, ?)", (user.id, user.username or "", now)); conn.execute("UPDATE users SET username=? WHERE telegram_id=?", (user.username or "", user.id)); conn.execute("INSERT OR IGNORE INTO wallets(telegram_id,points,updated_at) VALUES(?,?,?)",(user.id,0,now)); conn.commit(); conn.close()
 
 def setting(key, default):
     conn = db(); row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone(); conn.close()
@@ -48,6 +54,47 @@ def free_plan():
         "disk": int(setting("free_disk_mb", config.TRIAL_DISK_MB)),
         "cpu": int(setting("free_cpu", config.TRIAL_CPU)),
     }
+
+def points_balance(uid):
+    conn=db(); row=conn.execute("SELECT points FROM wallets WHERE telegram_id=?",(int(uid),)).fetchone(); conn.close(); return int(row["points"]) if row else 0
+
+def change_points(uid, delta, kind, reference=""):
+    conn=db()
+    try:
+        conn.execute("INSERT OR IGNORE INTO wallets(telegram_id,points,updated_at) VALUES(?,?,?)",(int(uid),0,datetime.now().isoformat()))
+        row=conn.execute("SELECT points FROM wallets WHERE telegram_id=?",(int(uid),)).fetchone(); new=int(row["points"])+int(delta)
+        if new < 0: conn.rollback(); return False, int(row["points"])
+        conn.execute("UPDATE wallets SET points=?,updated_at=? WHERE telegram_id=?",(new,datetime.now().isoformat(),int(uid)))
+        conn.execute("INSERT INTO points_ledger(telegram_id,delta,kind,reference,created_at) VALUES(?,?,?,?,?)",(int(uid),int(delta),kind,reference,datetime.now().isoformat()))
+        conn.commit(); return True,new
+    except Exception: conn.rollback(); raise
+    finally: conn.close()
+
+def transfer_points(sender, receiver, amount):
+    if int(amount) <= 0 or int(sender)==int(receiver): return False,"invalid"
+    conn=db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        a=conn.execute("SELECT points FROM wallets WHERE telegram_id=?",(int(sender),)).fetchone()
+        if not a or int(a["points"]) < int(amount): conn.rollback(); return False,"insufficient"
+        conn.execute("INSERT OR IGNORE INTO wallets(telegram_id,points,updated_at) VALUES(?,?,?)",(int(receiver),0,datetime.now().isoformat()))
+        for uid,delta in ((sender,-int(amount)),(receiver,int(amount))):
+            conn.execute("UPDATE wallets SET points=points+?,updated_at=? WHERE telegram_id=?",(delta,datetime.now().isoformat(),int(uid)))
+            conn.execute("INSERT INTO points_ledger(telegram_id,delta,kind,reference,created_at) VALUES(?,?,?,?,?)",(int(uid),delta,"transfer",str(sender),datetime.now().isoformat()))
+        conn.commit(); return True,"ok"
+    except Exception: conn.rollback(); raise
+    finally: conn.close()
+
+def refund_purchase(context, uid):
+    plan=context.user_data.pop("purchase_plan",None)
+    if plan:
+        change_points(uid,int(plan["points"]),"purchase_refund",plan["name"])
+
+PLANS={
+    "basic":{"name":"Basic","points":100,"days":7,"memory":1024,"disk":2048,"cpu":100},
+    "pro":{"name":"Pro","points":250,"days":30,"memory":2048,"disk":4096,"cpu":150},
+    "max":{"name":"Max","points":500,"days":30,"memory":4096,"disk":10240,"cpu":200},
+}
 
 def trial_available(uid):
     conn = db(); row = conn.execute("SELECT trial_used FROM users WHERE telegram_id=?", (uid,)).fetchone(); conn.close(); return not row or not row["trial_used"]
@@ -68,7 +115,7 @@ def subscription_text():
     return f"\n\n{config.SUBSCRIPTION_MESSAGE}"
 
 def main_keyboard(dev=False):
-    rows = [["🖥️ إنشاء سيرفر", "📋 سيرفراتي"], ["✅ حالة البوت", "💳 الاشتراك"]]
+    rows = [["🖥️ إنشاء سيرفر", "🛒 شراء بالنقاط"], ["📋 سيرفراتي", "👤 ملفي"], ["💰 تحويل نقاط", "🎁 كود هدية"], ["✅ حالة البوت", "💳 الاشتراك"]]
     if dev:
         rows += [["📊 الإحصائيات", "🗂️ كل السيرفرات"], ["👥 المستخدمون", "📣 إذاعة"], ["⚙️ الخطة المجانية", "⛔ إيقاف الكل"], ["▶️ تشغيل الكل"]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
@@ -116,6 +163,21 @@ def load_eggs():
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user)
+    if context.args:
+        token=context.args[0]
+        if token.startswith("ref_"):
+            try:
+                ref=int(token[4:])
+                if ref != update.effective_user.id:
+                    conn=db(); exists=conn.execute("SELECT 1 FROM referrals WHERE referred_id=?",(update.effective_user.id,)).fetchone()
+                    if not exists and conn.execute("SELECT 1 FROM users WHERE telegram_id=?",(ref,)).fetchone():
+                        conn.execute("INSERT INTO referrals(referred_id,referrer_id,reward_granted,created_at) VALUES(?,?,0,?)",(update.effective_user.id,ref,datetime.now().isoformat())); conn.commit(); conn.close()
+                        change_points(ref,50,"referral",str(update.effective_user.id)); change_points(update.effective_user.id,25,"referral",str(ref))
+                        await update.message.reply_text("🎉 تمت إضافة مكافأة الإحالة: 25 نقطة لك و50 نقطة لصاحب الرابط.")
+                    else: conn.close()
+            except Exception: pass
+        elif token.startswith("gift_"):
+            await redeem_gift(update, token[5:])
     if not is_dev(update.effective_user.id):
         text = (
             "👋 **مرحباً بك في Arab Code Hosting!**\n\n"
@@ -193,8 +255,8 @@ async def create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return ADMIN_CHOOSE_TYPE
     if not is_dev(update.effective_user.id) and not trial_available(update.effective_user.id):
-        await update.message.reply_text("⚠️ لقد استخدمت تجربتك المجانية بالفعل." + subscription_text())
-        return
+        kb=[[InlineKeyboardButton(f"🛒 {v['name']} — {v['points']} نقطة",callback_data=f"plan_{k}")] for k,v in PLANS.items()]
+        await update.message.reply_text("⚠️ انتهت التجربة المجانية. اختر خطة للشراء بالنقاط:",reply_markup=InlineKeyboardMarkup(kb)); return CHOOSE_TYPE
     if not EGGS_CACHE:
         load_eggs()
     if not EGGS_CACHE:
@@ -322,8 +384,16 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     if q.data == "cancel":
+        refund_purchase(context, update.effective_user.id)
         await q.edit_message_text("❌ تم الإلغاء.")
         return ConversationHandler.END
+    if q.data.startswith("plan_"):
+        key=q.data[5:]; plan=PLANS.get(key)
+        if not plan: await q.edit_message_text("❌ الخطة غير موجودة."); return ConversationHandler.END
+        ok,balance=change_points(update.effective_user.id,-plan["points"],"purchase",key)
+        if not ok: await q.edit_message_text(f"❌ رصيدك غير كافٍ. تحتاج {plan['points']} نقطة، رصيدك {balance}."); return ConversationHandler.END
+        context.user_data["purchase_plan"]=plan
+        await q.edit_message_text(f"✅ تم حجز {plan['name']} مقابل {plan['points']} نقطة. اختر البيضة:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🐍 Python",callback_data="type_python"),InlineKeyboardButton("🟢 Node.js",callback_data="type_node")],[InlineKeyboardButton("❌ إلغاء",callback_data="cancel")]])); return CHOOSE_TYPE
     stype = q.data.replace("type_", "")
     context.user_data["type"] = stype
     context.user_data["egg"] = EGGS_CACHE[stype]
@@ -349,6 +419,7 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ جاري الإنشاء...")
     uid, err = pt.create_user(email, username, password)
     if err:
+        refund_purchase(context, update.effective_user.id)
         await msg.edit_text(f"❌ فشل إنشاء المستخدم: {err}")
         return ConversationHandler.END
     is_py = (stype == "python")
@@ -360,9 +431,10 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     alloc_id, err = pt.get_free_allocation(1)
     if err:
         pt.delete_user(uid)
+        refund_purchase(context, update.effective_user.id)
         await msg.edit_text(f"❌ لا يوجد تخصيص متاح: {err}")
         return ConversationHandler.END
-    plan = free_plan()
+    plan = context.user_data.get("purchase_plan") or free_plan()
     limits = {"memory": plan["memory"], "swap": 0, "disk": plan["disk"], "io": 500, "cpu": plan["cpu"]}
     server, err = pt.create_server(uid, egg["id"], f"{username}-srv",
         docker, startup, env, alloc_id, limits=limits)
@@ -375,10 +447,11 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 docker, startup, env, fresh_alloc)
     if err:
         pt.delete_user(uid)
+        refund_purchase(context, update.effective_user.id)
         await msg.edit_text(f"❌ فشل إنشاء السيرفر: {err}")
         return ConversationHandler.END
     sid = server["id"]
-    plan = free_plan()
+    plan = context.user_data.pop("purchase_plan", None) or plan
     expiry = datetime.now() + timedelta(days=plan["days"])
     save_owned_server(update.effective_user.id, sid, uid, expiry)
     if not is_dev(update.effective_user.id):
@@ -395,6 +468,7 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    refund_purchase(context, update.effective_user.id)
     await update.message.reply_text("❌ تم الإلغاء.")
     return ConversationHandler.END
 
@@ -481,6 +555,7 @@ async def manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_dev(update.effective_user.id):
         kb = [[InlineKeyboardButton("⏹ إيقاف", callback_data=f"act_suspend_{sid}"), InlineKeyboardButton("▶️ تشغيل", callback_data=f"act_unsuspend_{sid}")],
               [InlineKeyboardButton("🔄 إعادة تثبيت", callback_data=f"act_reinstall_{sid}"), InlineKeyboardButton("📊 الموارد", callback_data=f"act_res_{sid}")],
+              [InlineKeyboardButton("⚡ ترقية بالنقاط", callback_data=f"act_upgrade_{sid}")],
               [InlineKeyboardButton("🔙 رجوع", callback_data="back_servers")]]
         await q.edit_message_text(text + subscription_text(), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
@@ -521,6 +596,10 @@ async def server_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expiry, err = extend_owned_server(sid, config.SERVER_DURATION_DAYS)
         await q.edit_message_text((f"✅ **تم التجديد!**\n🆔 `{sid}`\n📅 `{expiry.strftime('%Y-%m-%d %H:%M')}`" if not err else f"❌ {err}"), parse_mode="Markdown")
         return
+    elif action == "upgrade":
+        kb=[[InlineKeyboardButton(f"⬆️ {v['name']} — {v['points']} نقطة",callback_data=f"upgrade_{sid}_{k}")] for k,v in PLANS.items()]
+        kb.append([InlineKeyboardButton("🔙 رجوع",callback_data=f"mng_{sid}")])
+        await q.edit_message_text("⚡ اختر ترقية الموارد والمدة:",reply_markup=InlineKeyboardMarkup(kb)); return
     elif action == "res":
         srv, err = pt.get_server(sid)
         if err:
@@ -552,6 +631,22 @@ async def server_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
         return
     await manage(update, context)
+
+async def upgrade_plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    _,sid,key=q.data.split("_"); plan=PLANS.get(key)
+    if not plan or (not is_dev(update.effective_user.id) and not owns_server(update.effective_user.id,sid)):
+        await q.edit_message_text("⛔ غير مسموح."); return
+    ok,balance=change_points(update.effective_user.id,-plan["points"],"upgrade",f"{sid}:{key}")
+    if not ok: await q.answer(f"❌ تحتاج {plan['points']} نقطة. رصيدك {balance}.",show_alert=True); return
+    srv,err=pt.get_server(sid)
+    if err: change_points(update.effective_user.id,plan["points"],"upgrade_refund",sid); await q.edit_message_text(f"❌ {err}"); return
+    a=srv["attributes"]; old=a["limits"]
+    _,err=pt.update_server_build(sid,{"memory":plan["memory"],"disk":plan["disk"],"cpu":plan["cpu"],"swap":old.get("swap",0),"io":old.get("io",500),"threads":old.get("threads"),"oom_disabled":old.get("oom_disabled",True)})
+    if err:
+        change_points(update.effective_user.id,plan["points"],"upgrade_refund",sid); await q.edit_message_text(f"❌ فشل تحديث الموارد: {err}"); return
+    expiry,err=extend_owned_server(sid,plan["days"])
+    await q.edit_message_text((f"✅ تمت الترقية!\n💰 {plan['points']} نقطة\n💾 RAM {plan['memory']}MB\n💿 Disk {plan['disk']}MB\n⚡ CPU {plan['cpu']}%\n📅 حتى {expiry.strftime('%Y-%m-%d %H:%M')}" if not err else f"✅ الموارد حدثت، لكن تعذر تمديد المدة: {err}"))
 
 async def set_egg_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -703,6 +798,60 @@ async def unsuspend_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ok += 1
     await update.message.reply_text(f"▶️ تم — ✅ {ok} | ❌ {bad}")
 
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user); uid=update.effective_user.id
+    conn=db(); u=conn.execute("SELECT first_seen,username,trial_used FROM users WHERE telegram_id=?",(uid,)).fetchone(); refs=conn.execute("SELECT count(*) c FROM referrals WHERE referrer_id=?",(uid,)).fetchone()["c"]; conn.close()
+    link=f"https://t.me/{(await context.bot.get_me()).username}?start=ref_{uid}"
+    await update.message.reply_text(f"👤 ملفك الشخصي\n\n🆔 {uid}\n👤 @{u['username'] or 'بدون'}\n💰 النقاط: {points_balance(uid)}\n👥 الإحالات: {refs}\n🎁 رابط الإحالة:\n{link}")
+
+async def buy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await create_start(update, context)
+
+async def transfer_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    register_user(update.effective_user)
+    if len(context.args)==2:
+        try: receiver,amount=int(context.args[0]),int(context.args[1])
+        except Exception: await update.message.reply_text("الاستخدام: /transfer USER_ID AMOUNT"); return
+        ok,why=transfer_points(update.effective_user.id,receiver,amount)
+        await update.message.reply_text("✅ تم التحويل وأُنشئت حركة مالية." if ok else "❌ الرصيد غير كافٍ أو البيانات غير صحيحة."); return
+    await update.message.reply_text("الاستخدام: `/transfer USER_ID AMOUNT`",parse_mode="Markdown")
+
+async def gift_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return
+    if len(context.args)!=3:
+        await update.message.reply_text("الاستخدام: `/gift POINTS USES HOURS`",parse_mode="Markdown"); return
+    try: points,uses,hours=map(int,context.args)
+    except Exception: await update.message.reply_text("❌ أرسل أرقامًا صحيحة."); return
+    if points<=0 or uses<=0 or uses>10000 or hours<=0 or hours>8760: await update.message.reply_text("❌ حدود غير مسموحة."); return
+    import secrets
+    code=secrets.token_urlsafe(9).replace("-","").replace("_","").upper(); exp=datetime.now()+timedelta(hours=hours); conn=db(); conn.execute("INSERT INTO gift_codes VALUES(?,?,?,?,?,?,?)",(code,points,uses,0,exp.isoformat(),update.effective_user.id,datetime.now().isoformat())); conn.commit(); conn.close()
+    me=await context.bot.get_me(); await update.message.reply_text(f"🎁 كود الهدية:\n`{code}`\n🔗 https://t.me/{me.username}?start=gift_{code}\n💰 {points} نقطة | 👥 {uses} استخدام | ⏳ حتى {exp.strftime('%Y-%m-%d %H:%M')}",parse_mode="Markdown")
+
+async def redeem_gift(update, code):
+    uid=update.effective_user.id; conn=db()
+    try:
+        conn.execute("BEGIN IMMEDIATE"); row=conn.execute("SELECT * FROM gift_codes WHERE code=?",(code.upper(),)).fetchone()
+        if not row or row["uses"]>=row["max_uses"] or datetime.fromisoformat(row["expires_at"])<=datetime.now(): conn.rollback(); await update.message.reply_text("❌ الكود غير صالح أو منتهي."); return
+        conn.execute("INSERT INTO gift_redemptions VALUES(?,?,?)",(code.upper(),uid,datetime.now().isoformat())); conn.execute("UPDATE gift_codes SET uses=uses+1 WHERE code=?",(code.upper(),)); conn.commit()
+    except Exception:
+        conn.rollback(); await update.message.reply_text("⚠️ تم استخدام هذا الكود مسبقًا أو حدث تعارض."); return
+    finally: conn.close()
+    change_points(uid,int(row["points"]),"gift",code.upper()); await update.message.reply_text(f"🎉 تمت إضافة {row['points']} نقطة إلى رصيدك.")
+
+async def add_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return
+    if len(context.args)!=2:
+        await update.message.reply_text("الاستخدام: `/add-credits USER_ID POINTS`",parse_mode="Markdown"); return
+    try: uid,amount=int(context.args[0]),int(context.args[1])
+    except Exception: await update.message.reply_text("❌ البيانات غير صحيحة."); return
+    if amount<=0 or amount>1000000: await update.message.reply_text("❌ قيمة غير مسموحة."); return
+    ok,balance=change_points(uid,amount,"admin_credit",str(update.effective_user.id))
+    if not ok: await update.message.reply_text("❌ تعذر إضافة النقاط."); return
+    invoice=f"🧾 **فاتورة إضافة نقاط**\n\n👤 المستخدم: `{uid}`\n➕ النقاط: `{amount}`\n💰 الرصيد الجديد: `{balance}`"
+    await update.message.reply_text(invoice,parse_mode="Markdown")
+    try: await context.bot.send_message(uid,invoice+"\n\n✅ تم الإيداع بواسطة الإدارة.",parse_mode="Markdown")
+    except Exception: pass
+
 async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_dev(update.effective_user.id): return
     conn = db(); rows = conn.execute("SELECT telegram_id, username, first_seen, trial_used FROM users ORDER BY first_seen DESC").fetchall(); conn.close()
@@ -714,7 +863,7 @@ async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
         name = f"@{r['username']}" if r['username'] else str(r['telegram_id'])
         text.append(f"• `{r['telegram_id']}` — {name} — {'استعمل التجربة' if r['trial_used'] else 'التجربة متاحة'}")
         kb.append([InlineKeyboardButton(f"🖥️ سيرفرات {name}", callback_data=f"adm_user_{r['telegram_id']}")])
-    await update.message.reply_text("\n".join(text), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    await update.message.reply_text("\n".join(text), reply_markup=InlineKeyboardMarkup(kb))
 
 def extend_owned_server(sid, days):
     conn=db(); row=conn.execute("SELECT expires_at FROM owned_servers WHERE server_id=?",(int(sid),)).fetchone()
@@ -831,6 +980,10 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👥 المستخدمون": admin_users,
         "📣 إذاعة": admin_broadcast_start,
         "⚙️ الخطة المجانية": admin_plan_start,
+        "👤 ملفي": profile,
+        "🛒 شراء بالنقاط": buy_start,
+        "💰 تحويل نقاط": transfer_start,
+        "🎁 كود هدية": gift_start,
     }
     handler = routes.get(update.message.text)
     if handler:
@@ -881,10 +1034,16 @@ def main():
     app.add_handler(CommandHandler("changegg", changegg_cmd))
     app.add_handler(CommandHandler("suspendall", suspend_all))
     app.add_handler(CommandHandler("unsuspendall", unsuspend_all))
-    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(🖥️ إنشاء سيرفر|📋 سيرفراتي|✅ حالة البوت|💳 الاشتراك|📊 الإحصائيات|🗂️ كل السيرفرات|⛔ إيقاف الكل|▶️ تشغيل الكل)$"), menu_router))
+    app.add_handler(CommandHandler("profile", profile))
+    app.add_handler(CommandHandler("transfer", transfer_start))
+    app.add_handler(CommandHandler("gift", gift_start))
+    app.add_handler(CommandHandler("addcredits", add_credits))
+    app.add_handler(CommandHandler("add_credits", add_credits))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(🖥️ إنشاء سيرفر|🛒 شراء بالنقاط|📋 سيرفراتي|👤 ملفي|💰 تحويل نقاط|🎁 كود هدية|✅ حالة البوت|💳 الاشتراك|📊 الإحصائيات|🗂️ كل السيرفرات|👥 المستخدمون|📣 إذاعة|⚙️ الخطة المجانية|⛔ إيقاف الكل|▶️ تشغيل الكل)$"), menu_router))
     app.add_handler(CallbackQueryHandler(paginate, pattern="^pg_"))
     app.add_handler(CallbackQueryHandler(manage, pattern="^mng_"))
     app.add_handler(CallbackQueryHandler(set_egg_cb, pattern="^setegg_"))
+    app.add_handler(CallbackQueryHandler(upgrade_plan_cb, pattern="^upgrade_"))
     app.add_handler(CallbackQueryHandler(confirm_delete, pattern="^confdel_"))
     app.add_handler(CallbackQueryHandler(back_servers, pattern="^back_servers$"))
     app.add_handler(CallbackQueryHandler(server_action, pattern="^act_"))
@@ -898,6 +1057,8 @@ def main():
             ("users", "مستخدمو Telegram"),
             ("broadcast", "إذاعة للمستخدمين"),
             ("freeplan", "إعداد الخطة المجانية"),
+            ("profile", "ملفي ورصيدي"),
+            ("transfer", "تحويل نقاط"),
         ])
         asyncio.create_task(expiry_loop())
         asyncio.create_task(daily_notifications_loop(application))

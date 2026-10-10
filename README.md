@@ -41,6 +41,7 @@ The project is designed for operators who want to offer managed application host
 - Subscription/contact flow for post-trial upgrades.
 - Branded welcome screen with a custom image and persistent keyboard.
 - Daily server-expiry notifications with configurable trial-plan resources.
+- Points wallet with referral rewards, atomic transfers, gift codes, invoices, and plan purchases.
 
 ### Administrator experience
 
@@ -53,6 +54,7 @@ The project is designed for operators who want to offer managed application host
 - Configurable pricing model for RAM, disk, and CPU.
 - Server renewal, egg switching, password changes, bulk suspension, and bulk unsuspension.
 - Admin user directory, per-user server view, broadcast messaging, and live free-plan settings.
+- Admin crediting with an auditable points ledger and protected gift-code generation.
 - Official Telegram command menu registration.
 
 ### Operations and security
@@ -189,6 +191,7 @@ Change these values in `.env`; pricing is informational and should be connected 
 - Use a dedicated Pterodactyl API key and the smallest practical permission set.
 - Review admin IDs before deploying the bot.
 - Do not paste customer passwords into public issues or support channels.
+- Points are changed through transactional ledger entries; negative balances, duplicate gift redemptions, self-transfers, and expired codes are rejected.
 
 Read [SECURITY.md](SECURITY.md) for the vulnerability-reporting policy.
 
