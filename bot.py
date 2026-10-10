@@ -16,6 +16,7 @@ ADMIN_CHOOSE_TYPE, ADMIN_CHOOSE_RAM, ADMIN_CHOOSE_DISK, ADMIN_CHOOSE_CPU, ADMIN_
 ASK_NEW_PASS = 10
 ASK_EMAIL_FOR_PASS, ASK_PASS_NEW = range(11, 13)
 ASK_BROADCAST, ASK_PLAN = range(30, 32)
+ASK_CREDIT_USER, ASK_CREDIT_AMOUNT = range(32, 34)
 
 EGGS_CACHE = {}
 ALLOCATION_CACHE = {}
@@ -838,19 +839,39 @@ async def redeem_gift(update, code):
     finally: conn.close()
     change_points(uid,int(row["points"]),"gift",code.upper()); await update.message.reply_text(f"🎉 تمت إضافة {row['points']} نقطة إلى رصيدك.")
 
-async def add_credits(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_dev(update.effective_user.id): return
-    if len(context.args)!=2:
-        await update.message.reply_text("الاستخدام: `/add-credits USER_ID POINTS`",parse_mode="Markdown"); return
-    try: uid,amount=int(context.args[0]),int(context.args[1])
-    except Exception: await update.message.reply_text("❌ البيانات غير صحيحة."); return
-    if amount<=0 or amount>1000000: await update.message.reply_text("❌ قيمة غير مسموحة."); return
-    ok,balance=change_points(uid,amount,"admin_credit",str(update.effective_user.id))
-    if not ok: await update.message.reply_text("❌ تعذر إضافة النقاط."); return
-    invoice=f"🧾 **فاتورة إضافة نقاط**\n\n👤 المستخدم: `{uid}`\n➕ النقاط: `{amount}`\n💰 الرصيد الجديد: `{balance}`"
-    await update.message.reply_text(invoice,parse_mode="Markdown")
-    try: await context.bot.send_message(uid,invoice+"\n\n✅ تم الإيداع بواسطة الإدارة.",parse_mode="Markdown")
+async def finish_add_credit(update, context, uid, amount):
+    if int(amount)<=0 or int(amount)>1000000:
+        await update.message.reply_text("❌ قيمة النقاط يجب أن تكون بين 1 و1,000,000."); return ConversationHandler.END
+    ok,balance=change_points(int(uid),int(amount),"admin_credit",str(update.effective_user.id))
+    if not ok:
+        await update.message.reply_text("❌ تعذر إضافة النقاط."); return ConversationHandler.END
+    invoice=f"🧾 فاتورة إضافة نقاط\n\n👤 المستخدم: {uid}\n➕ النقاط: {amount}\n💰 الرصيد الجديد: {balance}"
+    await update.message.reply_text(invoice)
+    try: await context.bot.send_message(int(uid),invoice+"\n\n✅ تم الإيداع بواسطة الإدارة.")
     except Exception: pass
+    return ConversationHandler.END
+
+async def add_credits_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return ConversationHandler.END
+    if len(context.args)==2:
+        try: return await finish_add_credit(update,context,int(context.args[0]),int(context.args[1]))
+        except Exception: await update.message.reply_text("❌ البيانات غير صحيحة."); return ConversationHandler.END
+    await update.message.reply_text("👤 أرسل Telegram ID المستخدم:")
+    return ASK_CREDIT_USER
+
+async def receive_credit_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return ConversationHandler.END
+    try: context.user_data["credit_uid"]=int(update.message.text.strip())
+    except Exception: await update.message.reply_text("❌ أرسل ID رقميًا."); return ASK_CREDIT_USER
+    await update.message.reply_text("💰 أرسل عدد النقاط المراد إضافتها:")
+    return ASK_CREDIT_AMOUNT
+
+async def receive_credit_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return ConversationHandler.END
+    try: amount=int(update.message.text.strip())
+    except Exception: await update.message.reply_text("❌ أرسل عددًا صحيحًا."); return ASK_CREDIT_AMOUNT
+    return await finish_add_credit(update,context,context.user_data.pop("credit_uid",0),amount)
+
 
 async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_dev(update.effective_user.id): return
@@ -1037,8 +1058,10 @@ def main():
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(CommandHandler("transfer", transfer_start))
     app.add_handler(CommandHandler("gift", gift_start))
-    app.add_handler(CommandHandler("addcredits", add_credits))
-    app.add_handler(CommandHandler("add_credits", add_credits))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("addcredits", add_credits_start), CommandHandler("add_credits", add_credits_start)],
+        states={ASK_CREDIT_USER:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_credit_user)], ASK_CREDIT_AMOUNT:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_credit_amount)]},
+        fallbacks=[CommandHandler("cancel", cancel)]))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(🖥️ إنشاء سيرفر|🛒 شراء بالنقاط|📋 سيرفراتي|👤 ملفي|💰 تحويل نقاط|🎁 كود هدية|✅ حالة البوت|💳 الاشتراك|📊 الإحصائيات|🗂️ كل السيرفرات|👥 المستخدمون|📣 إذاعة|⚙️ الخطة المجانية|⛔ إيقاف الكل|▶️ تشغيل الكل)$"), menu_router))
     app.add_handler(CallbackQueryHandler(paginate, pattern="^pg_"))
     app.add_handler(CallbackQueryHandler(manage, pattern="^mng_"))
