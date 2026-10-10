@@ -642,7 +642,12 @@ async def upgrade_plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     srv,err=pt.get_server(sid)
     if err: change_points(update.effective_user.id,plan["points"],"upgrade_refund",sid); await q.edit_message_text(f"❌ {err}"); return
     a=srv["attributes"]; old=a["limits"]
-    _,err=pt.update_server_build(sid,{"memory":plan["memory"],"disk":plan["disk"],"cpu":plan["cpu"],"swap":old.get("swap",0),"io":old.get("io",500),"threads":old.get("threads"),"oom_disabled":old.get("oom_disabled",True)})
+    allocation=a.get("allocation")
+    if isinstance(allocation,dict): allocation=allocation.get("id")
+    if not allocation:
+        change_points(update.effective_user.id,plan["points"],"upgrade_refund",sid)
+        await q.edit_message_text("❌ تعذر معرفة تخصيص السيرفر، وتم رد النقاط. تواصل مع الأدمن."); return
+    _,err=pt.update_server_build(sid,{"memory":plan["memory"],"disk":plan["disk"],"cpu":plan["cpu"],"swap":old.get("swap",0),"io":old.get("io",500),"threads":old.get("threads"),"oom_disabled":old.get("oom_disabled",True),"allocation":int(allocation),"feature_limits":a.get("feature_limits",{"databases":0,"allocations":0,"backups":0})})
     if err:
         change_points(update.effective_user.id,plan["points"],"upgrade_refund",sid); await q.edit_message_text(f"❌ فشل تحديث الموارد: {err}"); return
     expiry,err=extend_owned_server(sid,plan["days"])
