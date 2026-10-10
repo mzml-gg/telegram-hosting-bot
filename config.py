@@ -4,9 +4,18 @@ Copy .env.example to .env for local development. Never commit .env.
 """
 import os
 
+_file_env = {}
+for _path in ("/home/container/.runtime.env", ".runtime.env"):
+    if os.path.exists(_path):
+        for _line in open(_path, encoding="utf-8"):
+            _line = _line.strip()
+            if _line and not _line.startswith("#") and "=" in _line:
+                _key, _value = _line.split("=", 1)
+                _file_env[_key.strip()] = _value.strip().strip('"').strip("'")
+
 
 def env(name, default=""):
-    return os.getenv(name, default).strip()
+    return os.getenv(name, _file_env.get(name, default)).strip()
 
 
 PANEL_URL = env("PANEL_URL", "https://panel.example.com")

@@ -15,6 +15,7 @@ CHOOSE_TYPE, ENTER_EMAIL = range(2)
 ADMIN_CHOOSE_TYPE, ADMIN_CHOOSE_RAM, ADMIN_CHOOSE_DISK, ADMIN_CHOOSE_CPU, ADMIN_ENTER_EMAIL = range(20, 25)
 ASK_NEW_PASS = 10
 ASK_EMAIL_FOR_PASS, ASK_PASS_NEW = range(11, 13)
+ASK_BROADCAST, ASK_PLAN = range(30, 32)
 
 EGGS_CACHE = {}
 ALLOCATION_CACHE = {}
@@ -24,11 +25,29 @@ def db():
     conn.row_factory = sqlite3.Row
     conn.execute("CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, username TEXT, first_seen TEXT NOT NULL, trial_used INTEGER NOT NULL DEFAULT 0)")
     conn.execute("CREATE TABLE IF NOT EXISTS owned_servers (telegram_id INTEGER NOT NULL, server_id INTEGER PRIMARY KEY, panel_user_id INTEGER NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS notification_log (telegram_id INTEGER, server_id INTEGER, day TEXT, PRIMARY KEY(telegram_id, server_id, day))")
+    conn.execute("CREATE TABLE IF NOT EXISTS backup_requests (server_id INTEGER PRIMARY KEY, requested_at TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending')")
     conn.commit()
     return conn
 
 def register_user(user):
     conn = db(); conn.execute("INSERT OR IGNORE INTO users(telegram_id, username, first_seen) VALUES (?, ?, ?)", (user.id, user.username or "", datetime.now().isoformat())); conn.execute("UPDATE users SET username=? WHERE telegram_id=?", (user.username or "", user.id)); conn.commit(); conn.close()
+
+def setting(key, default):
+    conn = db(); row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone(); conn.close()
+    return row["value"] if row else str(default)
+
+def set_setting(key, value):
+    conn = db(); conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value))); conn.commit(); conn.close()
+
+def free_plan():
+    return {
+        "days": int(setting("free_days", config.SERVER_DURATION_DAYS)),
+        "memory": int(setting("free_memory_mb", config.TRIAL_MEMORY_MB)),
+        "disk": int(setting("free_disk_mb", config.TRIAL_DISK_MB)),
+        "cpu": int(setting("free_cpu", config.TRIAL_CPU)),
+    }
 
 def trial_available(uid):
     conn = db(); row = conn.execute("SELECT trial_used FROM users WHERE telegram_id=?", (uid,)).fetchone(); conn.close(); return not row or not row["trial_used"]
@@ -51,7 +70,7 @@ def subscription_text():
 def main_keyboard(dev=False):
     rows = [["🖥️ إنشاء سيرفر", "📋 سيرفراتي"], ["✅ حالة البوت", "💳 الاشتراك"]]
     if dev:
-        rows += [["📊 الإحصائيات", "🗂️ كل السيرفرات"], ["⛔ إيقاف الكل", "▶️ تشغيل الكل"]]
+        rows += [["📊 الإحصائيات", "🗂️ كل السيرفرات"], ["👥 المستخدمون", "📣 إذاعة"], ["⚙️ الخطة المجانية", "⛔ إيقاف الكل"], ["▶️ تشغيل الكل"]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -121,6 +140,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🧩 `/changegg <id>` — تغيير البيضة\n"
         "⛔ `/suspendall` — إيقاف الكل\n"
         "✅ `/unsuspendall` — تشغيل الكل\n"
+        "👥 `/users` — مستخدمو Telegram\n"
+        "📣 `/broadcast` — إذاعة\n"
+        "⚙️ `/freeplan` — إعداد الخطة المجانية\n"
         f"ℹ️ `/status` — حالة البوت",
         parse_mode="Markdown", reply_markup=main_keyboard(True))
 
@@ -340,8 +362,10 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pt.delete_user(uid)
         await msg.edit_text(f"❌ لا يوجد تخصيص متاح: {err}")
         return ConversationHandler.END
+    plan = free_plan()
+    limits = {"memory": plan["memory"], "swap": 0, "disk": plan["disk"], "io": 500, "cpu": plan["cpu"]}
     server, err = pt.create_server(uid, egg["id"], f"{username}-srv",
-        docker, startup, env, alloc_id)
+        docker, startup, env, alloc_id, limits=limits)
     if err and ("[404]" in err or "[409]" in err or "allocation" in err.lower()):
         # A stale allocation or a transient Wings response should not consume
         # the user's trial. Fetch another free allocation and retry once.
@@ -354,7 +378,8 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.edit_text(f"❌ فشل إنشاء السيرفر: {err}")
         return ConversationHandler.END
     sid = server["id"]
-    expiry = datetime.now() + timedelta(days=config.SERVER_DURATION_DAYS)
+    plan = free_plan()
+    expiry = datetime.now() + timedelta(days=plan["days"])
     save_owned_server(update.effective_user.id, sid, uid, expiry)
     if not is_dev(update.effective_user.id):
         mark_trial_used(update.effective_user.id)
@@ -364,7 +389,7 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.edit_text(
         f"✅ **تم إنشاء السيرفر!**\n\n📧 `{email}`\n🔑 `{password}`\n"
         f"👤 `{username}`\n\n🌐 {config.PANEL_URL}\n🆔 `{sid}`\n"
-        f"🧩 {stype.upper()}\n⏳ {config.SERVER_DURATION_DAYS} أيام\n"
+        f"🧩 {stype.upper()}\n⏳ {plan['days']} أيام\n"
         f"📅 {expiry.strftime('%Y-%m-%d %H:%M')}\n\n⚠️ احفظ البيانات!",
         parse_mode="Markdown")
     return ConversationHandler.END
@@ -493,14 +518,8 @@ async def server_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _, err = pt.reinstall_server(sid)
         await q.answer("✅ تم الإرسال" if not err else f"❌ {err}", show_alert=True)
     elif action == "renew":
-        expiry = datetime.now() + timedelta(days=config.SERVER_DURATION_DAYS)
-        pt.update_server_details(sid, {
-            "description": f"expires_at={expiry.isoformat()}",
-            "external_id": expiry.isoformat()})
-        pt.unsuspend_server(sid)
-        await q.edit_message_text(
-            f"✅ **تم التجديد!**\n🆔 `{sid}`\n📅 `{expiry.strftime('%Y-%m-%d %H:%M')}`",
-            parse_mode="Markdown")
+        expiry, err = extend_owned_server(sid, config.SERVER_DURATION_DAYS)
+        await q.edit_message_text((f"✅ **تم التجديد!**\n🆔 `{sid}`\n📅 `{expiry.strftime('%Y-%m-%d %H:%M')}`" if not err else f"❌ {err}"), parse_mode="Markdown")
         return
     elif action == "res":
         srv, err = pt.get_server(sid)
@@ -631,16 +650,11 @@ async def renew_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("`/renew <server_id>`", parse_mode="Markdown")
         return
     sid = context.args[0]
-    expiry = datetime.now() + timedelta(days=config.SERVER_DURATION_DAYS)
-    _, err = pt.update_server_details(sid, {
-        "description": f"expires_at={expiry.isoformat()}",
-        "external_id": expiry.isoformat()})
+    expiry, err = extend_owned_server(sid, config.SERVER_DURATION_DAYS)
     if err:
         await update.message.reply_text(f"❌ {err}")
         return
-    pt.unsuspend_server(sid)
-    await update.message.reply_text(
-        f"✅ تم التجديد حتى `{expiry.strftime('%Y-%m-%d %H:%M')}`", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ تم التجديد حتى `{expiry.strftime('%Y-%m-%d %H:%M')}`", parse_mode="Markdown")
 
 async def changegg_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_dev(update.effective_user.id):
@@ -689,6 +703,105 @@ async def unsuspend_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ok += 1
     await update.message.reply_text(f"▶️ تم — ✅ {ok} | ❌ {bad}")
 
+async def admin_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return
+    conn = db(); rows = conn.execute("SELECT telegram_id, username, first_seen, trial_used FROM users ORDER BY first_seen DESC").fetchall(); conn.close()
+    if not rows:
+        await update.message.reply_text("📭 لا يوجد مستخدمون مسجلون بعد."); return
+    text = [f"👥 **مستخدمو Telegram ({len(rows)})**\n"]
+    kb = []
+    for r in rows[:50]:
+        name = f"@{r['username']}" if r['username'] else str(r['telegram_id'])
+        text.append(f"• `{r['telegram_id']}` — {name} — {'استعمل التجربة' if r['trial_used'] else 'التجربة متاحة'}")
+        kb.append([InlineKeyboardButton(f"🖥️ سيرفرات {name}", callback_data=f"adm_user_{r['telegram_id']}")])
+    await update.message.reply_text("\n".join(text), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+def extend_owned_server(sid, days):
+    conn=db(); row=conn.execute("SELECT expires_at FROM owned_servers WHERE server_id=?",(int(sid),)).fetchone()
+    if not row: conn.close(); return None, "السيرفر غير مسجل في البوت"
+    current=datetime.fromisoformat(row["expires_at"]); base=max(current,datetime.now()); expiry=base+timedelta(days=int(days))
+    conn.execute("UPDATE owned_servers SET expires_at=? WHERE server_id=?",(expiry.isoformat(),int(sid))); conn.commit(); conn.close()
+    _, err=pt.update_server_details(sid,{"description":f"expires_at={expiry.isoformat()}","external_id":expiry.isoformat()})
+    if err: return None, err
+    pt.unsuspend_server(sid); return expiry, None
+
+async def admin_user_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_dev(update.effective_user.id): return
+    uid=int(q.data.split("_")[-1]); conn=db(); rows=conn.execute("SELECT server_id,expires_at FROM owned_servers WHERE telegram_id=? ORDER BY created_at DESC",(uid,)).fetchall(); conn.close()
+    if not rows: await q.edit_message_text(f"📭 لا توجد سيرفرات للمستخدم `{uid}`.", parse_mode="Markdown"); return
+    lines=[f"🖥️ **سيرفرات المستخدم** `{uid}`\n"]
+    for r in rows:
+        left=max(0,(datetime.fromisoformat(r['expires_at'])-datetime.now()).days)
+        lines.append(f"• السيرفر `{r['server_id']}` — متبقي `{left}` يوم — ينتهي `{r['expires_at'][:16].replace('T',' ')}`")
+    kb=[[InlineKeyboardButton(f"➕ 7 أيام للسيرفر {r['server_id']}",callback_data=f"adm_extend_{r['server_id']}_7"), InlineKeyboardButton(f"➕ 30 يومًا",callback_data=f"adm_extend_{r['server_id']}_30")] for r in rows]
+    await q.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+
+async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return ConversationHandler.END
+    await update.message.reply_text("📣 أرسل نص الإذاعة الآن. اكتب /cancel للإلغاء.")
+    return ASK_BROADCAST
+
+async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return ConversationHandler.END
+    conn=db(); ids=[r[0] for r in conn.execute("SELECT telegram_id FROM users").fetchall()]; conn.close()
+    ok=bad=0
+    for uid in ids:
+        try:
+            await context.bot.send_message(uid, update.message.text)
+            ok += 1
+            await asyncio.sleep(0.05)
+        except Exception as exc:
+            bad += 1; log.warning("broadcast failed for %s: %s", uid, exc)
+    await update.message.reply_text(f"📣 اكتملت الإذاعة\n✅ تم الإرسال: `{ok}`\n❌ فشل: `{bad}`", parse_mode="Markdown")
+    return ConversationHandler.END
+
+async def admin_plan_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return ConversationHandler.END
+    p=free_plan()
+    await update.message.reply_text(f"⚙️ الخطة الحالية: {p['days']} يوم | RAM {p['memory']}MB | Disk {p['disk']}MB | CPU {p['cpu']}%\n\nأرسل بالشكل:\n`days=7 ram=1024 disk=2048 cpu=100`", parse_mode="Markdown")
+    return ASK_PLAN
+
+async def receive_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return ConversationHandler.END
+    import re
+    vals={k:int(v) for k,v in re.findall(r"(days|ram|disk|cpu)\s*=\s*(\d+)", update.message.text.lower())}
+    if set(vals) != {"days","ram","disk","cpu"} or any(v < 0 for v in vals.values()) or vals["days"] == 0:
+        await update.message.reply_text("❌ الصيغة غير صحيحة. مثال: `days=7 ram=1024 disk=2048 cpu=100`", parse_mode="Markdown"); return ASK_PLAN
+    for k,v in vals.items(): set_setting("free_" + ("memory_mb" if k=="ram" else "disk_mb" if k=="disk" else k), v)
+    p=free_plan(); await update.message.reply_text(f"✅ تم تحديث الخطة المجانية:\n📅 {p['days']} يوم\n💾 RAM {p['memory']}MB\n💿 Disk {p['disk']}MB\n⚡ CPU {p['cpu']}%")
+    return ConversationHandler.END
+
+async def daily_notifications_loop(application):
+    while True:
+        try:
+            conn=db(); rows=conn.execute("SELECT telegram_id,server_id,expires_at FROM owned_servers").fetchall()
+            today=datetime.now().date().isoformat()
+            for r in rows:
+                left=(datetime.fromisoformat(r['expires_at'])-datetime.now()).total_seconds()
+                days=max(0,int(left//86400))
+                if days <= 0: status_text="⛔ انتهت الصلاحية وسيتم إيقاف السيرفر."
+                elif days <= 3: status_text=f"⚠️ متبقي {days} يوم فقط — تواصل مع {config.DEVELOPER_USERNAME} للتجديد."
+                else: status_text=f"✅ متبقي {days} يوم."
+                exists=conn.execute("SELECT 1 FROM notification_log WHERE telegram_id=? AND server_id=? AND day=?",(r['telegram_id'],r['server_id'],today)).fetchone()
+                if not exists:
+                    try:
+                        await application.bot.send_message(r['telegram_id'], f"🔔 تحديث السيرفر `{r['server_id']}`\n{status_text}\n📅 الانتهاء: `{r['expires_at'][:16].replace('T',' ')}`", parse_mode="Markdown")
+                        conn.execute("INSERT OR IGNORE INTO notification_log VALUES (?,?,?)",(r['telegram_id'],r['server_id'],today)); conn.commit()
+                    except Exception as exc: log.warning("notification failed for %s: %s",r['telegram_id'],exc)
+                if days <= 1:
+                    conn.execute("INSERT OR IGNORE INTO backup_requests VALUES (?,?,?)",(r['server_id'],datetime.now().isoformat(),"pending")); conn.commit()
+            conn.close()
+        except Exception as exc: log.error("daily notification loop failed: %s",exc)
+        await asyncio.sleep(config.TRIAL_CHECK_INTERVAL_SECONDS)
+
+async def admin_extend_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_dev(update.effective_user.id): return
+    _,_,sid,days=q.data.split("_")
+    expiry,err=extend_owned_server(sid,int(days))
+    await q.edit_message_text((f"✅ تم تمديد السيرفر `{sid}` حتى `{expiry.strftime('%Y-%m-%d %H:%M')}`" if not err else f"❌ {err}"),parse_mode="Markdown")
+
 async def expiry_loop():
     while True:
         try:
@@ -715,6 +828,9 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🗂️ كل السيرفرات": servers_list,
         "⛔ إيقاف الكل": suspend_all,
         "▶️ تشغيل الكل": unsuspend_all,
+        "👥 المستخدمون": admin_users,
+        "📣 إذاعة": admin_broadcast_start,
+        "⚙️ الخطة المجانية": admin_plan_start,
     }
     handler = routes.get(update.message.text)
     if handler:
@@ -736,6 +852,17 @@ def main():
                 ADMIN_CHOOSE_CPU: [CallbackQueryHandler(admin_choose_cpu, pattern="^admin_(cpu_|back_disk)")],
                 ADMIN_ENTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_receive_email)]},
         fallbacks=[CommandHandler("cancel", cancel)]))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("broadcast", admin_broadcast_start), MessageHandler(filters.Regex("^📣 إذاعة$"), admin_broadcast_start)],
+        states={ASK_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast)]},
+        fallbacks=[CommandHandler("cancel", cancel)]))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("freeplan", admin_plan_start), MessageHandler(filters.Regex("^⚙️ الخطة المجانية$"), admin_plan_start)],
+        states={ASK_PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_plan)]},
+        fallbacks=[CommandHandler("cancel", cancel)]))
+    app.add_handler(CommandHandler("users", admin_users))
+    app.add_handler(CallbackQueryHandler(admin_user_servers, pattern="^adm_user_"))
+    app.add_handler(CallbackQueryHandler(admin_extend_cb, pattern="^adm_extend_"))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("chpass", chpass_cmd)],
         states={ASK_EMAIL_FOR_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_email_for_pass)],
@@ -768,8 +895,12 @@ def main():
             ("servers", "سيرفراتي"),
             ("status", "حالة البوت"),
             ("subscribe", "الاشتراك والتجديد"),
+            ("users", "مستخدمو Telegram"),
+            ("broadcast", "إذاعة للمستخدمين"),
+            ("freeplan", "إعداد الخطة المجانية"),
         ])
         asyncio.create_task(expiry_loop())
+        asyncio.create_task(daily_notifications_loop(application))
     app.post_init = after_start
     log.info("🤖 البوت يعمل...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

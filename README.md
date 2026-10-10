@@ -40,6 +40,7 @@ The project is designed for operators who want to offer managed application host
 - Server list, status, resource information, suspend, unsuspend, and reinstall actions.
 - Subscription/contact flow for post-trial upgrades.
 - Branded welcome screen with a custom image and persistent keyboard.
+- Daily server-expiry notifications with configurable trial-plan resources.
 
 ### Administrator experience
 
@@ -51,6 +52,7 @@ The project is designed for operators who want to offer managed application host
 - Resource-aware provisioning and formatted invoices.
 - Configurable pricing model for RAM, disk, and CPU.
 - Server renewal, egg switching, password changes, bulk suspension, and bulk unsuspension.
+- Admin user directory, per-user server view, broadcast messaging, and live free-plan settings.
 - Official Telegram command menu registration.
 
 ### Operations and security
@@ -61,6 +63,10 @@ The project is designed for operators who want to offer managed application host
 - One retry for transient allocation/Wings errors.
 - No database, token, or API key is included in the public package.
 - MIT licensed and easy to extend.
+
+### Expiry backup worker
+
+The optional host-side worker in [`ops/backup_expiring.py`](ops/backup_expiring.py) archives a Pterodactyl volume shortly before expiry, stores it under a protected backup directory, and sends the archive to the configured developer when it fits Telegram's upload limit. Larger archives remain on the VPS and generate an alert instead. Run it from a root-owned cron or systemd timer; do not expose the worker's environment file.
 
 ## Architecture
 
@@ -191,6 +197,7 @@ Read [SECURITY.md](SECURITY.md) for the vulnerability-reporting policy.
 ```text
 .
 ├── assets/eagle.jpg       # Branded welcome image
+├── ops/backup_expiring.py # Optional host-side expiry backup worker
 ├── bot.py                 # Telegram handlers and user/admin workflows
 ├── config.py              # Environment-backed configuration
 ├── main.py                # Application entry point
