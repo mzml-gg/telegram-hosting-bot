@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 ENV_FILE = os.getenv("BACKUP_ENV_FILE", "/etc/arab-code-hosting-backup.env")
 VOLUME_ROOT = os.getenv("PTERO_VOLUME_ROOT", "/var/lib/pterodactyl/volumes")
 BACKUP_ROOT = os.getenv("BACKUP_ROOT", "/var/backups/arab-code-hosting")
-DB_PATH = os.getenv("BOT_DB_PATH", "/var/lib/pterodactyl/volumes/e54f2383-a3ca-4172-a98e-7afac2f57d30/hosting_bot.sqlite3")
+DB_PATH = os.getenv("BOT_DB_PATH", "/var/lib/pterodactyl/volumes/BOT_SERVER_UUID/hosting_bot.sqlite3")
 WINDOW_HOURS = int(os.getenv("BACKUP_WINDOW_HOURS", "30"))
 MAX_TELEGRAM_BYTES = 49 * 1024 * 1024
 
