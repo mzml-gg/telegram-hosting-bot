@@ -26,6 +26,7 @@ def db():
     conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("CREATE TABLE IF NOT EXISTS users (telegram_id INTEGER PRIMARY KEY, username TEXT, first_seen TEXT NOT NULL, trial_used INTEGER NOT NULL DEFAULT 0)")
+    conn.execute("CREATE TABLE IF NOT EXISTS server_credentials (server_id INTEGER PRIMARY KEY, telegram_id INTEGER NOT NULL, email TEXT NOT NULL, username TEXT NOT NULL, password TEXT NOT NULL, updated_at TEXT NOT NULL)")
     conn.execute("CREATE TABLE IF NOT EXISTS owned_servers (telegram_id INTEGER NOT NULL, server_id INTEGER PRIMARY KEY, panel_user_id INTEGER NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL)")
     conn.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     conn.execute("CREATE TABLE IF NOT EXISTS notification_log (telegram_id INTEGER, server_id INTEGER, day TEXT, PRIMARY KEY(telegram_id, server_id, day))")
@@ -106,8 +107,8 @@ def trial_available(uid):
 def mark_trial_used(uid):
     conn = db(); conn.execute("UPDATE users SET trial_used=1 WHERE telegram_id=?", (uid,)); conn.commit(); conn.close()
 
-def save_owned_server(tg_id, server_id, panel_uid, expiry):
-    conn = db(); conn.execute("INSERT OR REPLACE INTO owned_servers VALUES (?, ?, ?, ?, ?)", (tg_id, int(server_id), int(panel_uid), expiry.isoformat(), datetime.now().isoformat())); conn.commit(); conn.close()
+def save_owned_server(tg_id, server_id, panel_uid, expiry, email="", username="", password=""):
+    conn = db(); now=datetime.now().isoformat(); conn.execute("INSERT OR REPLACE INTO owned_servers VALUES (?, ?, ?, ?, ?)", (tg_id, int(server_id), int(panel_uid), expiry.isoformat(), now)); conn.execute("INSERT OR REPLACE INTO server_credentials VALUES (?,?,?,?,?,?)",(int(server_id),int(tg_id),email,username,password,now)); conn.commit(); conn.close()
 
 def owned_server_ids(tg_id):
     conn = db(); rows = conn.execute("SELECT server_id FROM owned_servers WHERE telegram_id=?", (tg_id,)).fetchall(); conn.close(); return {int(r["server_id"]) for r in rows}
@@ -368,8 +369,8 @@ async def admin_receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE
         pt.delete_user(uid); await msg.edit_text(f"❌ فشل إنشاء السيرفر: {err}"); return ConversationHandler.END
     sid = server["id"]
     expiry = datetime.now() + timedelta(days=config.ADMIN_SERVER_DURATION_DAYS)
-    save_owned_server(update.effective_user.id, sid, uid, expiry)
-    pt.update_server_details(sid, {"description": f"expires_at={expiry.isoformat()}", "external_id": expiry.isoformat()})
+    save_owned_server(update.effective_user.id, sid, uid, expiry, email, username, password)
+    pt.update_server_details(sid, {"name": f"{username}-srv", "user": int(uid), "description": f"expires_at={expiry.isoformat()}", "external_id": expiry.isoformat()})
     invoice = ("🧾 **فاتورة إنشاء سيرفر**\n\n"
         f"🆔 رقم السيرفر: `{sid}`\n📧 الحساب: `{email}`\n🔑 كلمة المرور: `{password}`\n"
         f"👤 اسم المستخدم: `{username}`\n🧩 البيضة: `{stype.upper()}`\n\n"
@@ -453,10 +454,11 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sid = server["id"]
     plan = context.user_data.pop("purchase_plan", None) or plan
     expiry = datetime.now() + timedelta(days=plan["days"])
-    save_owned_server(update.effective_user.id, sid, uid, expiry)
+    save_owned_server(update.effective_user.id, sid, uid, expiry, email, username, password)
     if not is_dev(update.effective_user.id):
         mark_trial_used(update.effective_user.id)
     pt.update_server_details(sid, {
+        "name": f"{username}-srv", "user": int(uid),
         "description": f"expires_at={expiry.isoformat()}",
         "external_id": expiry.isoformat()})
     await msg.edit_text(
@@ -487,7 +489,7 @@ async def servers_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if err or not srv: continue
         a = srv["attributes"]; icon = "⛔" if a.get("suspended") else "✅"
         lines.append(f"{icon} `{sid}` — {a['name']}")
-        kb.append([InlineKeyboardButton(f"⚙️ {a['name']}", callback_data=f"mng_{sid}")])
+        kb.append([InlineKeyboardButton(f"⚙️ {a['name']}", callback_data=f"mng_{sid}"), InlineKeyboardButton("📄 بيانات", callback_data=f"data_{sid}")])
     await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
 
 async def _show_servers(update, page=0):
@@ -528,6 +530,22 @@ async def paginate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     await _show_servers(update, int(q.data.split("_")[1]))
+
+async def server_data_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    sid=int(q.data.split("_",1)[1])
+    if not is_dev(update.effective_user.id) and not owns_server(update.effective_user.id,sid):
+        await q.answer("⛔ هذا السيرفر ليس لك.",show_alert=True); return
+    srv,err=pt.get_server(sid)
+    if err or not srv: await q.edit_message_text(f"❌ تعذر قراءة السيرفر: {err}"); return
+    a=srv["attributes"]; conn=db(); row=conn.execute("SELECT expires_at FROM owned_servers WHERE server_id=?",(sid,)).fetchone(); cred=conn.execute("SELECT email,username,password FROM server_credentials WHERE server_id=?",(sid,)).fetchone(); conn.close()
+    if not cred:
+        u,ue=pt.get_user(a.get("user")) if a.get("user") else (None,"غير متاح")
+        attrs=u.get("attributes",{}) if u else {}; email=attrs.get("email","غير محفوظ"); username=attrs.get("username","غير محفوظ"); password="غير محفوظ — استخدم تغيير كلمة المرور"
+    else: email,username,password=cred["email"],cred["username"],cred["password"]
+    l=a.get("limits",{}); status="موقوف" if a.get("suspended") else "يعمل"; expiry=row["expires_at"][:16].replace("T"," ") if row else "غير مسجل"
+    text=(f"📄 بيانات السيرفر {sid}\n\n🖥️ الاسم: {a.get('name','-')}\n📡 الحالة: {status}\n\n📧 الإيميل: {email}\n👤 اسم المستخدم: {username}\n🔑 كلمة المرور: {password}\n\n🌐 رابط اللوحة: {config.PANEL_URL}\n🆔 Server ID: {sid}\n🧩 Egg ID: {a.get('egg','-')}\n💾 RAM: {l.get('memory','-')} MB\n💿 Disk: {l.get('disk','-')} MB\n⚡ CPU: {l.get('cpu','-')}%\n📅 ينتهي: {expiry}")
+    await q.edit_message_text(text,reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ إدارة السيرفر",callback_data=f"mng_{sid}")]]))
 
 async def manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -930,9 +948,14 @@ def extend_owned_server(sid, days):
     conn=db(); row=conn.execute("SELECT expires_at FROM owned_servers WHERE server_id=?",(int(sid),)).fetchone()
     if not row: conn.close(); return None, "السيرفر غير مسجل في البوت"
     current=datetime.fromisoformat(row["expires_at"]); base=max(current,datetime.now()); expiry=base+timedelta(days=int(days))
+    srv, serr=pt.get_server(sid)
+    if serr or not srv: conn.close(); return None, serr or "تعذر قراءة السيرفر"
+    current_name=srv["attributes"].get("name") or f"server-{sid}"
+    current_user=srv["attributes"].get("user")
+    if not current_user: conn.close(); return None, "تعذر معرفة مالك السيرفر"
+    _, err=pt.update_server_details(sid,{"name":current_name,"user":int(current_user),"description":f"expires_at={expiry.isoformat()}","external_id":expiry.isoformat()})
+    if err: conn.close(); return None, err
     conn.execute("UPDATE owned_servers SET expires_at=? WHERE server_id=?",(expiry.isoformat(),int(sid))); conn.commit(); conn.close()
-    _, err=pt.update_server_details(sid,{"description":f"expires_at={expiry.isoformat()}","external_id":expiry.isoformat()})
-    if err: return None, err
     pt.unsuspend_server(sid); return expiry, None
 
 async def admin_user_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1110,6 +1133,7 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)]))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(🖥️ إنشاء سيرفر|🛒 شراء بالنقاط|📋 سيرفراتي|👤 ملفي|💰 تحويل نقاط|🎁 كود هدية|✅ حالة البوت|💳 الاشتراك|📊 الإحصائيات|🗂️ كل السيرفرات|👥 المستخدمون|📣 إذاعة|⚙️ الخطة المجانية|⛔ إيقاف الكل|▶️ تشغيل الكل)$"), menu_router))
     app.add_handler(CallbackQueryHandler(paginate, pattern="^pg_"))
+    app.add_handler(CallbackQueryHandler(server_data_cb, pattern="^data_"))
     app.add_handler(CallbackQueryHandler(manage, pattern="^mng_"))
     app.add_handler(CallbackQueryHandler(set_egg_cb, pattern="^setegg_"))
     app.add_handler(CallbackQueryHandler(upgrade_plan_cb, pattern="^upgrade_"))

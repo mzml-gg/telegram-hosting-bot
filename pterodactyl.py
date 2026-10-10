@@ -58,6 +58,8 @@ def create_server(user_id, egg_id, name, docker_image, startup, environment, all
 
 def get_server(server_id):
     return api("GET", f"/servers/{server_id}")
+def get_user(user_id):
+    return api("GET", f"/users/{user_id}")
 
 def list_servers():
     return api("GET", "/servers")
