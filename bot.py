@@ -1,7 +1,7 @@
 # bot.py
 import random, string, logging, sqlite3, asyncio, os
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, ConversationHandler, MessageHandler, filters)
 import config
@@ -17,6 +17,7 @@ ASK_NEW_PASS = 10
 ASK_EMAIL_FOR_PASS, ASK_PASS_NEW = range(11, 13)
 ASK_BROADCAST, ASK_PLAN = range(30, 32)
 ASK_CREDIT_USER, ASK_CREDIT_AMOUNT = range(32, 34)
+ASK_TRANSFER_USER, ASK_TRANSFER_AMOUNT, ASK_GIFT_CODE, ASK_GIFT_SPEC = range(34, 38)
 
 EGGS_CACHE = {}
 ALLOCATION_CACHE = {}
@@ -60,6 +61,8 @@ def points_balance(uid):
     conn=db(); row=conn.execute("SELECT points FROM wallets WHERE telegram_id=?",(int(uid),)).fetchone(); conn.close(); return int(row["points"]) if row else 0
 
 def change_points(uid, delta, kind, reference=""):
+    if int(uid) == config.DEVELOPER_ID and int(delta) < 0:
+        return True, 10**12
     conn=db()
     try:
         conn.execute("INSERT OR IGNORE INTO wallets(telegram_id,points,updated_at) VALUES(?,?,?)",(int(uid),0,datetime.now().isoformat()))
@@ -113,7 +116,7 @@ def owns_server(tg_id, sid):
     return int(sid) in owned_server_ids(tg_id)
 
 def subscription_text():
-    return f"\n\n{config.SUBSCRIPTION_MESSAGE}"
+    return config.SUBSCRIPTION_MESSAGE
 
 def main_keyboard(dev=False):
     rows = [["🖥️ إنشاء سيرفر", "🛒 شراء بالنقاط"], ["📋 سيرفراتي", "👤 ملفي"], ["💰 تحويل نقاط", "🎁 كود هدية"], ["✅ حالة البوت", "💳 الاشتراك"]]
@@ -122,11 +125,7 @@ def main_keyboard(dev=False):
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "💳 **الاشتراك بعد انتهاء التجربة**\n\n"
-        f"{config.SUBSCRIPTION_MESSAGE}\n\n"
-        "أرسل للمطور اسم المستخدم أو رقم السيرفر ليتم التجديد.",
-        parse_mode="Markdown", reply_markup=main_keyboard(is_dev(update.effective_user.id)))
+    await update.message.reply_text(subscription_text(), reply_markup=main_keyboard(is_dev(update.effective_user.id)))
 
 def is_dev(uid):
     return uid == config.DEVELOPER_ID
@@ -392,7 +391,7 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key=q.data[5:]; plan=PLANS.get(key)
         if not plan: await q.edit_message_text("❌ الخطة غير موجودة."); return ConversationHandler.END
         ok,balance=change_points(update.effective_user.id,-plan["points"],"purchase",key)
-        if not ok: await q.edit_message_text(f"❌ رصيدك غير كافٍ. تحتاج {plan['points']} نقطة، رصيدك {balance}."); return ConversationHandler.END
+        if not ok: await q.edit_message_text(f"❌ ليس لديك رصيد كافٍ. تحتاج {plan['points']} نقطة، ورصيدك {balance}.\n\nلجمع النقاط استخدم رابط الإحالة أو تواصل مع الأدمن @Monte_dev_md."); return ConversationHandler.END
         context.user_data["purchase_plan"]=plan
         await q.edit_message_text(f"✅ تم حجز {plan['name']} مقابل {plan['points']} نقطة. اختر البيضة:",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🐍 Python",callback_data="type_python"),InlineKeyboardButton("🟢 Node.js",callback_data="type_node")],[InlineKeyboardButton("❌ إلغاء",callback_data="cancel")]])); return CHOOSE_TYPE
     stype = q.data.replace("type_", "")
@@ -808,25 +807,61 @@ async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def buy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await create_start(update, context)
 
+async def finish_transfer(update, context, receiver, amount):
+    ok,_=transfer_points(update.effective_user.id,int(receiver),int(amount))
+    if not ok: await update.message.reply_text("❌ لا يوجد رصيد كافٍ أو البيانات غير صحيحة."); return ConversationHandler.END
+    await update.message.reply_text(f"✅ تم تحويل {amount} نقطة إلى المستخدم {receiver} وتسجيل العملية.")
+    try: await context.bot.send_message(int(receiver),f"💰 استلمت {amount} نقطة من مستخدم آخر.")
+    except Exception: pass
+    return ConversationHandler.END
+
 async def transfer_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user)
     if len(context.args)==2:
-        try: receiver,amount=int(context.args[0]),int(context.args[1])
-        except Exception: await update.message.reply_text("الاستخدام: /transfer USER_ID AMOUNT"); return
-        ok,why=transfer_points(update.effective_user.id,receiver,amount)
-        await update.message.reply_text("✅ تم التحويل وأُنشئت حركة مالية." if ok else "❌ الرصيد غير كافٍ أو البيانات غير صحيحة."); return
-    await update.message.reply_text("الاستخدام: `/transfer USER_ID AMOUNT`",parse_mode="Markdown")
+        try: return await finish_transfer(update,context,int(context.args[0]),int(context.args[1]))
+        except Exception: await update.message.reply_text("❌ البيانات غير صحيحة."); return ConversationHandler.END
+    await update.message.reply_text("👤 أرسل Telegram ID المستلم:")
+    return ASK_TRANSFER_USER
+
+async def receive_transfer_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: context.user_data["transfer_uid"]=int(update.message.text.strip())
+    except Exception: await update.message.reply_text("❌ أرسل ID رقميًا."); return ASK_TRANSFER_USER
+    await update.message.reply_text("💰 أرسل عدد النقاط المراد تحويلها:")
+    return ASK_TRANSFER_AMOUNT
+
+async def receive_transfer_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: amount=int(update.message.text.strip())
+    except Exception: await update.message.reply_text("❌ أرسل عددًا صحيحًا."); return ASK_TRANSFER_AMOUNT
+    return await finish_transfer(update,context,context.user_data.pop("transfer_uid",0),amount)
+
+async def create_gift(update, context, points, uses, hours):
+    if points<=0 or uses<=0 or uses>10000 or hours<=0 or hours>8760:
+        await update.message.reply_text("❌ الحدود: النقاط أكبر من 0، الاستخدامات 1-10000، والمدة 1-8760 ساعة."); return ConversationHandler.END
+    import secrets
+    code=secrets.token_urlsafe(9).replace("-","").replace("_","").upper(); exp=datetime.now()+timedelta(hours=hours)
+    conn=db(); conn.execute("INSERT INTO gift_codes VALUES(?,?,?,?,?,?,?)",(code,points,uses,0,exp.isoformat(),update.effective_user.id,datetime.now().isoformat())); conn.commit(); conn.close()
+    me=await context.bot.get_me(); await update.message.reply_text(f"🎁 تم إنشاء كود الهدية\n\nالكود: {code}\nالرابط: https://t.me/{me.username}?start=gift_{code}\nالقيمة: {points} نقطة\nالاستخدامات: {uses}\nينتهي: {exp.strftime('%Y-%m-%d %H:%M')}")
+    return ConversationHandler.END
 
 async def gift_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_dev(update.effective_user.id): return
-    if len(context.args)!=3:
-        await update.message.reply_text("الاستخدام: `/gift POINTS USES HOURS`",parse_mode="Markdown"); return
-    try: points,uses,hours=map(int,context.args)
-    except Exception: await update.message.reply_text("❌ أرسل أرقامًا صحيحة."); return
-    if points<=0 or uses<=0 or uses>10000 or hours<=0 or hours>8760: await update.message.reply_text("❌ حدود غير مسموحة."); return
-    import secrets
-    code=secrets.token_urlsafe(9).replace("-","").replace("_","").upper(); exp=datetime.now()+timedelta(hours=hours); conn=db(); conn.execute("INSERT INTO gift_codes VALUES(?,?,?,?,?,?,?)",(code,points,uses,0,exp.isoformat(),update.effective_user.id,datetime.now().isoformat())); conn.commit(); conn.close()
-    me=await context.bot.get_me(); await update.message.reply_text(f"🎁 كود الهدية:\n`{code}`\n🔗 https://t.me/{me.username}?start=gift_{code}\n💰 {points} نقطة | 👥 {uses} استخدام | ⏳ حتى {exp.strftime('%Y-%m-%d %H:%M')}",parse_mode="Markdown")
+    if is_dev(update.effective_user.id):
+        if len(context.args)==3:
+            try: return await create_gift(update,context,*map(int,context.args))
+            except Exception: await update.message.reply_text("❌ أرسل أرقامًا صحيحة."); return ConversationHandler.END
+        await update.message.reply_text("🎁 أرسل: عدد النقاط ثم عدد المستخدمين ثم الساعات\nمثال: 100 10 48")
+        return ASK_GIFT_SPEC
+    await update.message.reply_text("🎁 أرسل كود الهدية:")
+    return ASK_GIFT_CODE
+
+async def receive_gift_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code=update.message.text.strip().replace(" ","").upper()
+    await redeem_gift(update,code); return ConversationHandler.END
+
+async def receive_gift_spec(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try: values=list(map(int,update.message.text.split()))
+    except Exception: await update.message.reply_text("❌ أرسل ثلاثة أرقام: النقاط الاستخدامات الساعات."); return ASK_GIFT_SPEC
+    if len(values)!=3: await update.message.reply_text("❌ الصيغة: 100 10 48"); return ASK_GIFT_SPEC
+    return await create_gift(update,context,*values)
 
 async def redeem_gift(update, code):
     uid=update.effective_user.id; conn=db()
@@ -1018,7 +1053,7 @@ def main():
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("create", create_start),
                       MessageHandler(filters.Regex("^🖥️ إنشاء سيرفر$"), create_start)],
-        states={CHOOSE_TYPE: [CallbackQueryHandler(choose_type, pattern="^(type_|cancel)")],
+        states={CHOOSE_TYPE: [CallbackQueryHandler(choose_type, pattern="^(type_|plan_|cancel)")],
                 ENTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_email)],
                 ADMIN_CHOOSE_TYPE: [CallbackQueryHandler(admin_choose_type, pattern="^admin_(type_|cancel)")],
                 ADMIN_CHOOSE_RAM: [CallbackQueryHandler(admin_choose_ram, pattern="^admin_(ram_|back_type)")],
@@ -1033,6 +1068,14 @@ def main():
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("freeplan", admin_plan_start), MessageHandler(filters.Regex("^⚙️ الخطة المجانية$"), admin_plan_start)],
         states={ASK_PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_plan)]},
+        fallbacks=[CommandHandler("cancel", cancel)]))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("transfer", transfer_start), MessageHandler(filters.Regex("^💰 تحويل نقاط$"), transfer_start)],
+        states={ASK_TRANSFER_USER:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_transfer_user)], ASK_TRANSFER_AMOUNT:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_transfer_amount)]},
+        fallbacks=[CommandHandler("cancel", cancel)]))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("gift", gift_start), MessageHandler(filters.Regex("^🎁 كود هدية$"), gift_start)],
+        states={ASK_GIFT_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_gift_code)], ASK_GIFT_SPEC:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_gift_spec)]},
         fallbacks=[CommandHandler("cancel", cancel)]))
     app.add_handler(CommandHandler("users", admin_users))
     app.add_handler(CallbackQueryHandler(admin_user_servers, pattern="^adm_user_"))
@@ -1056,8 +1099,6 @@ def main():
     app.add_handler(CommandHandler("suspendall", suspend_all))
     app.add_handler(CommandHandler("unsuspendall", unsuspend_all))
     app.add_handler(CommandHandler("profile", profile))
-    app.add_handler(CommandHandler("transfer", transfer_start))
-    app.add_handler(CommandHandler("gift", gift_start))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("addcredits", add_credits_start), CommandHandler("add_credits", add_credits_start)],
         states={ASK_CREDIT_USER:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_credit_user)], ASK_CREDIT_AMOUNT:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_credit_amount)]},
@@ -1072,17 +1113,16 @@ def main():
     app.add_handler(CallbackQueryHandler(server_action, pattern="^act_"))
     async def after_start(application):
         await application.bot.set_my_commands([
-            ("start", "القائمة الرئيسية"),
-            ("create", "إنشاء سيرفر مجاني"),
-            ("servers", "سيرفراتي"),
-            ("status", "حالة البوت"),
-            ("subscribe", "الاشتراك والتجديد"),
-            ("users", "مستخدمو Telegram"),
-            ("broadcast", "إذاعة للمستخدمين"),
-            ("freeplan", "إعداد الخطة المجانية"),
-            ("profile", "ملفي ورصيدي"),
-            ("transfer", "تحويل نقاط"),
-        ])
+            BotCommand("start", "القائمة الرئيسية"), BotCommand("create", "إنشاء سيرفر"),
+            BotCommand("servers", "سيرفراتي"), BotCommand("status", "حالة البوت"),
+            BotCommand("subscribe", "الاشتراك عند المطور"), BotCommand("profile", "ملفي ورصيدي"),
+            BotCommand("transfer", "تحويل نقاط"),
+        ], scope=BotCommandScopeDefault())
+        await application.bot.set_my_commands([
+            BotCommand("users", "مستخدمو Telegram"), BotCommand("broadcast", "إذاعة"),
+            BotCommand("freeplan", "الخطة المجانية"), BotCommand("addcredits", "إضافة نقاط"),
+            BotCommand("gift", "إنشاء كود هدية"), BotCommand("stats", "الإحصائيات"),
+        ], scope=BotCommandScopeChat(chat_id=config.DEVELOPER_ID))
         asyncio.create_task(expiry_loop())
         asyncio.create_task(daily_notifications_loop(application))
     app.post_init = after_start
