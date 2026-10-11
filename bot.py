@@ -1,14 +1,15 @@
 # bot.py
-import random, string, logging, sqlite3, asyncio, os
+import random, string, logging, sqlite3, asyncio, os, warnings
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
     ContextTypes, ConversationHandler, MessageHandler, filters)
 import config
 import pterodactyl as pt
+from console_ui import configure_logging, print_banner
 
-logging.basicConfig(level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s")
+configure_logging()
+warnings.filterwarnings("ignore", message=r"If 'per_message=False'.*", category=Warning)
 log = logging.getLogger(__name__)
 
 CHOOSE_TYPE, ENTER_EMAIL = range(2)
@@ -1074,6 +1075,11 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handler(update, context)
 
 def main():
+    print_banner(config)
+    missing = config.missing_required()
+    if missing:
+        log.error("Missing required configuration: %s", ", ".join(missing))
+        return
     db()
     if not load_eggs():
         log.warning("⚠️ فشل اكتشاف البيض — ستُعاد عند /create")

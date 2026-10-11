@@ -52,5 +52,15 @@ DOCKER_PYTHON = env("DOCKER_PYTHON", "ghcr.io/parkervcp/yolks:python_3.11")
 STARTUP_NODE = env("STARTUP_NODE", "npm start")
 STARTUP_PYTHON = env("STARTUP_PYTHON", "python main.py")
 
-if not BOT_TOKEN or not APPLICATION_API_KEY:
-    raise RuntimeError("BOT_TOKEN and APPLICATION_API_KEY must be configured")
+def missing_required():
+    """Return required runtime settings that are absent, without exposing secrets."""
+    missing = []
+    if not BOT_TOKEN:
+        missing.append("BOT_TOKEN")
+    if not APPLICATION_API_KEY:
+        missing.append("APPLICATION_API_KEY")
+    if not PANEL_URL or PANEL_URL == "https://panel.example.com":
+        missing.append("PANEL_URL")
+    if not DEVELOPER_ID:
+        missing.append("DEVELOPER_ID")
+    return missing
