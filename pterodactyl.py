@@ -91,16 +91,23 @@ def list_nests():
 def list_eggs_in_nest(nest_id):
     return api("GET", f"/nests/{nest_id}/eggs")
 
-def list_allocations(node_id):
-    return api("GET", f"/nodes/{node_id}/allocations")
+def list_allocations(node_id, page=1):
+    # Ask for a larger page so free allocations after the first assigned
+    # ports are visible to the bot.
+    return api("GET", f"/nodes/{node_id}/allocations",
+               params={"page": page, "per_page": 100})
 
 def get_free_allocation(node_id):
-    res, err = list_allocations(node_id)
-    if err:
-        return None, err
-    for alloc in res.get("data", []):
-        if not alloc["attributes"].get("assigned"):
-            return alloc["attributes"]["id"], None
+    for page in range(1, 11):
+        res, err = list_allocations(node_id, page=page)
+        if err:
+            return None, err
+        for alloc in res.get("data", []):
+            if not alloc["attributes"].get("assigned"):
+                return alloc["attributes"]["id"], None
+        pagination = res.get("meta", {}).get("pagination", {})
+        if page >= int(pagination.get("current_page", page)) and page >= int(pagination.get("total_pages", page)):
+            break
     return None, "لا يوجد تخصيص متاح"
 
 def discover_eggs():

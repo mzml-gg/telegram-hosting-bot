@@ -1,5 +1,5 @@
 # bot.py
-import random, string, logging, sqlite3, asyncio, os, warnings
+import random, string, logging, sqlite3, asyncio, os, warnings, json, re
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, BotCommand, BotCommandScopeDefault, BotCommandScopeChat
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
@@ -19,6 +19,7 @@ ASK_EMAIL_FOR_PASS, ASK_PASS_NEW = range(11, 13)
 ASK_BROADCAST, ASK_PLAN = range(30, 32)
 ASK_CREDIT_USER, ASK_CREDIT_AMOUNT = range(32, 34)
 ASK_TRANSFER_USER, ASK_TRANSFER_AMOUNT, ASK_GIFT_CODE, ASK_GIFT_SPEC = range(34, 38)
+ASK_PLANS = 38
 
 EGGS_CACHE = {}
 ALLOCATION_CACHE = {}
@@ -96,11 +97,37 @@ def refund_purchase(context, uid):
     if plan:
         change_points(uid,int(plan["points"]),"purchase_refund",plan["name"])
 
-PLANS={
+DEFAULT_PLANS={
     "basic":{"name":"Basic","points":100,"days":7,"memory":1024,"disk":2048,"cpu":100},
     "pro":{"name":"Pro","points":250,"days":30,"memory":2048,"disk":4096,"cpu":150},
     "max":{"name":"Max","points":500,"days":30,"memory":4096,"disk":10240,"cpu":200},
 }
+
+def configured_plans():
+    try:
+        raw = setting("plans_json", "")
+        data = json.loads(raw) if raw else DEFAULT_PLANS
+        if not isinstance(data, dict) or not data:
+            return DEFAULT_PLANS
+        valid = {}
+        for key, value in data.items():
+            if not re.fullmatch(r"[a-z0-9_-]{1,24}", str(key)):
+                continue
+            if not isinstance(value, dict):
+                continue
+            required = ("name", "points", "days", "memory", "disk", "cpu")
+            if not all(k in value for k in required):
+                continue
+            item = {"name": str(value["name"])[:40],
+                    "points": int(value["points"]), "days": int(value["days"]),
+                    "memory": int(value["memory"]), "disk": int(value["disk"]),
+                    "cpu": int(value["cpu"])}
+            if item["points"] < 0 or item["days"] <= 0 or item["memory"] < 0 or item["disk"] < 0 or item["cpu"] < 0:
+                continue
+            valid[str(key)] = item
+        return valid or DEFAULT_PLANS
+    except Exception:
+        return DEFAULT_PLANS
 
 def trial_available(uid):
     conn = db(); row = conn.execute("SELECT trial_used FROM users WHERE telegram_id=?", (uid,)).fetchone(); conn.close(); return not row or not row["trial_used"]
@@ -123,7 +150,7 @@ def subscription_text():
 def main_keyboard(dev=False):
     rows = [["🖥️ إنشاء سيرفر", "🛒 شراء بالنقاط"], ["📋 سيرفراتي", "👤 ملفي"], ["💰 تحويل نقاط", "🎁 كود هدية"], ["✅ حالة البوت", "💳 الاشتراك"]]
     if dev:
-        rows += [["📊 الإحصائيات", "🗂️ كل السيرفرات"], ["👥 المستخدمون", "📣 إذاعة"], ["⚙️ الخطة المجانية", "⛔ إيقاف الكل"], ["▶️ تشغيل الكل"]]
+        rows += [["📊 الإحصائيات", "🗂️ كل السيرفرات"], ["👥 المستخدمون", "📣 إذاعة"], ["💰 خطط الأسعار", "⚙️ الخطة المجانية"], ["⛔ إيقاف الكل"], ["▶️ تشغيل الكل"]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, is_persistent=True)
 
 async def subscribe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -157,6 +184,7 @@ def load_eggs():
     nodes, err = pt.list_nodes()
     if not err and nodes.get("data"):
         node_id = nodes["data"][0]["attributes"]["id"]
+        ALLOCATION_CACHE["node_id"] = node_id
         alloc, _ = pt.get_free_allocation(node_id)
         if alloc:
             ALLOCATION_CACHE["id"] = alloc
@@ -257,7 +285,7 @@ async def create_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
         return ADMIN_CHOOSE_TYPE
     if not is_dev(update.effective_user.id) and not trial_available(update.effective_user.id):
-        kb=[[InlineKeyboardButton(f"🛒 {v['name']} — {v['points']} نقطة",callback_data=f"plan_{k}")] for k,v in PLANS.items()]
+        kb=[[InlineKeyboardButton(f"🛒 {v['name']} — {v['points']} نقطة",callback_data=f"plan_{k}")] for k,v in configured_plans().items()]
         await update.message.reply_text("⚠️ انتهت التجربة المجانية. اختر خطة للشراء بالنقاط:",reply_markup=InlineKeyboardMarkup(kb)); return CHOOSE_TYPE
     if not EGGS_CACHE:
         load_eggs()
@@ -357,7 +385,7 @@ async def admin_receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
     is_py = stype == "python"
     env = pt.build_environment(egg, is_py)
-    alloc_id, err = pt.get_free_allocation(1)
+    alloc_id, err = pt.get_free_allocation(ALLOCATION_CACHE.get("node_id", 1))
     if err:
         pt.delete_user(uid); await msg.edit_text(f"❌ لا يوجد تخصيص: {err}"); return ConversationHandler.END
     limits = {"memory": 0 if ram == "inf" else ram * 1024, "swap": 0,
@@ -390,7 +418,7 @@ async def choose_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("❌ تم الإلغاء.")
         return ConversationHandler.END
     if q.data.startswith("plan_"):
-        key=q.data[5:]; plan=PLANS.get(key)
+        key=q.data[5:]; plan=configured_plans().get(key)
         if not plan: await q.edit_message_text("❌ الخطة غير موجودة."); return ConversationHandler.END
         ok,balance=change_points(update.effective_user.id,-plan["points"],"purchase",key)
         if not ok: await q.edit_message_text(f"❌ ليس لديك رصيد كافٍ. تحتاج {plan['points']} نقطة، ورصيدك {balance}.\n\nلجمع النقاط استخدم رابط الإحالة أو تواصل مع الأدمن @Monte_dev_md."); return ConversationHandler.END
@@ -430,7 +458,7 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     env = pt.build_environment(egg, is_py)
     # Always ask Wings for a fresh free allocation; cached allocations become
     # assigned after the first server and can cause misleading create errors.
-    alloc_id, err = pt.get_free_allocation(1)
+    alloc_id, err = pt.get_free_allocation(ALLOCATION_CACHE.get("node_id", 1))
     if err:
         pt.delete_user(uid)
         refund_purchase(context, update.effective_user.id)
@@ -443,7 +471,7 @@ async def receive_email(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if err and ("[404]" in err or "[409]" in err or "allocation" in err.lower()):
         # A stale allocation or a transient Wings response should not consume
         # the user's trial. Fetch another free allocation and retry once.
-        fresh_alloc, alloc_err = pt.get_free_allocation(1)
+        fresh_alloc, alloc_err = pt.get_free_allocation(ALLOCATION_CACHE.get("node_id", 1))
         if fresh_alloc and fresh_alloc != alloc_id:
             server, err = pt.create_server(uid, egg["id"], f"{username}-srv",
                 docker, startup, env, fresh_alloc)
@@ -616,7 +644,7 @@ async def server_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text((f"✅ **تم التجديد!**\n🆔 `{sid}`\n📅 `{expiry.strftime('%Y-%m-%d %H:%M')}`" if not err else f"❌ {err}"), parse_mode="Markdown")
         return
     elif action == "upgrade":
-        kb=[[InlineKeyboardButton(f"⬆️ {v['name']} — {v['points']} نقطة",callback_data=f"upgrade_{sid}_{k}")] for k,v in PLANS.items()]
+        kb=[[InlineKeyboardButton(f"⬆️ {v['name']} — {v['points']} نقطة",callback_data=f"upgrade_{sid}_{k}")] for k,v in configured_plans().items()]
         kb.append([InlineKeyboardButton("🔙 رجوع",callback_data=f"mng_{sid}")])
         await q.edit_message_text("⚡ اختر ترقية الموارد والمدة:",reply_markup=InlineKeyboardMarkup(kb)); return
     elif action == "res":
@@ -653,7 +681,7 @@ async def server_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def upgrade_plan_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
-    _,sid,key=q.data.split("_"); plan=PLANS.get(key)
+    _,sid,key=q.data.split("_"); plan=configured_plans().get(key)
     if not plan or (not is_dev(update.effective_user.id) and not owns_server(update.effective_user.id,sid)):
         await q.edit_message_text("⛔ غير مسموح."); return
     ok,balance=change_points(update.effective_user.id,-plan["points"],"upgrade",f"{sid}:{key}")
@@ -990,6 +1018,49 @@ async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📣 اكتملت الإذاعة\n✅ تم الإرسال: `{ok}`\n❌ فشل: `{bad}`", parse_mode="Markdown")
     return ConversationHandler.END
 
+async def admin_plans_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return ConversationHandler.END
+    lines = ["💰 **خطط الأسعار الحالية**"]
+    for key, plan in configured_plans().items():
+        lines.append(f"{key}: {plan['name']} | {plan['points']} نقطة | {plan['days']} يوم | RAM {plan['memory']}MB | Disk {plan['disk']}MB | CPU {plan['cpu']}%")
+    lines.append("\nأرسل خطة أو عدة خطط، سطرًا لكل خطة بالصيغة:")
+    lines.append("`basic|Basic|100|7|1024|2048|100`")
+    lines.append("الترتيب: المفتاح | الاسم | النقاط | الأيام | RAM MB | Disk MB | CPU %")
+    lines.append("سيتم استبدال جميع الخطط بالقائمة الجديدة. /cancel للإلغاء.")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    return ASK_PLANS
+
+async def receive_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return ConversationHandler.END
+    plans = {}
+    errors = []
+    for number, line in enumerate(update.message.text.splitlines(), 1):
+        line = line.strip()
+        if not line: continue
+        parts = [x.strip() for x in line.split("|")]
+        if len(parts) != 7:
+            errors.append(f"السطر {number}: يحتاج 7 خانات")
+            continue
+        key, name, points, days, memory, disk, cpu = parts
+        if not re.fullmatch(r"[a-z0-9_-]{1,24}", key):
+            errors.append(f"السطر {number}: مفتاح غير صالح")
+            continue
+        try:
+            item = {"name": name[:40], "points": int(points), "days": int(days), "memory": int(memory), "disk": int(disk), "cpu": int(cpu)}
+        except ValueError:
+            errors.append(f"السطر {number}: الموارد والنقاط أرقام")
+            continue
+        if not name or item["points"] < 0 or item["days"] <= 0 or item["memory"] < 0 or item["disk"] < 0 or item["cpu"] < 0:
+            errors.append(f"السطر {number}: قيم غير صالحة")
+            continue
+        plans[key] = item
+    if errors or not plans:
+        await update.message.reply_text("❌ لم يتم الحفظ:\n" + "\n".join(errors or ["أضف خطة واحدة على الأقل"]) + "\n\nمثال: `basic|Basic|100|7|1024|2048|100`", parse_mode="Markdown")
+        return ASK_PLANS
+    set_setting("plans_json", json.dumps(plans, ensure_ascii=False, separators=(",", ":")))
+    await update.message.reply_text("✅ تم حفظ خطط الأسعار والموارد بنجاح:\n" + "\n".join(f"• {k}: {v['name']} — {v['points']} نقطة" for k,v in plans.items()))
+    return ConversationHandler.END
+
 async def admin_plan_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_dev(update.effective_user.id): return ConversationHandler.END
     p=free_plan()
@@ -1024,7 +1095,7 @@ async def daily_notifications_loop(application):
                         conn.execute("INSERT OR IGNORE INTO notification_log VALUES (?,?,?)",(r['telegram_id'],r['server_id'],today)); conn.commit()
                     except Exception as exc: log.warning("notification failed for %s: %s",r['telegram_id'],exc)
                 if days <= 1:
-                    conn.execute("INSERT OR IGNORE INTO backup_requests VALUES (?,?,?)",(r['server_id'],datetime.now().isoformat(),"pending")); conn.commit()
+                    conn.execute("INSERT OR IGNORE INTO backup_requests (server_id,requested_at,status) VALUES (?,?,?)",(r['server_id'],datetime.now().isoformat(),"pending")); conn.commit()
             conn.close()
         except Exception as exc: log.error("daily notification loop failed: %s",exc)
         await asyncio.sleep(config.TRIAL_CHECK_INTERVAL_SECONDS)
@@ -1064,6 +1135,7 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "▶️ تشغيل الكل": unsuspend_all,
         "👥 المستخدمون": admin_users,
         "📣 إذاعة": admin_broadcast_start,
+        "💰 خطط الأسعار": admin_plans_start,
         "⚙️ الخطة المجانية": admin_plan_start,
         "👤 ملفي": profile,
         "🛒 شراء بالنقاط": buy_start,
@@ -1102,6 +1174,10 @@ def main():
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("freeplan", admin_plan_start), MessageHandler(filters.Regex("^⚙️ الخطة المجانية$"), admin_plan_start)],
         states={ASK_PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_plan)]},
+        fallbacks=[CommandHandler("cancel", cancel)]))
+    app.add_handler(ConversationHandler(
+        entry_points=[CommandHandler("plans", admin_plans_start), MessageHandler(filters.Regex("^💰 خطط الأسعار$"), admin_plans_start)],
+        states={ASK_PLANS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_plans)]},
         fallbacks=[CommandHandler("cancel", cancel)]))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("transfer", transfer_start), MessageHandler(filters.Regex("^💰 تحويل نقاط$"), transfer_start)],
@@ -1155,7 +1231,7 @@ def main():
         ], scope=BotCommandScopeDefault())
         await application.bot.set_my_commands([
             BotCommand("users", "مستخدمو Telegram"), BotCommand("broadcast", "إذاعة"),
-            BotCommand("freeplan", "الخطة المجانية"), BotCommand("addcredits", "إضافة نقاط"),
+            BotCommand("freeplan", "الخطة المجانية"), BotCommand("plans", "خطط الأسعار"), BotCommand("addcredits", "إضافة نقاط"),
             BotCommand("gift", "إنشاء كود هدية"), BotCommand("stats", "الإحصائيات"),
         ], scope=BotCommandScopeChat(chat_id=config.DEVELOPER_ID))
         asyncio.create_task(expiry_loop())
