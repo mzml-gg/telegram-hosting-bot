@@ -20,6 +20,7 @@ ASK_BROADCAST, ASK_PLAN = range(30, 32)
 ASK_CREDIT_USER, ASK_CREDIT_AMOUNT = range(32, 34)
 ASK_TRANSFER_USER, ASK_TRANSFER_AMOUNT, ASK_GIFT_CODE, ASK_GIFT_SPEC = range(34, 38)
 ASK_PLANS = 38
+ASK_PLAN_EDIT = 39
 
 EGGS_CACHE = {}
 ALLOCATION_CACHE = {}
@@ -1018,21 +1019,132 @@ async def receive_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"📣 اكتملت الإذاعة\n✅ تم الإرسال: `{ok}`\n❌ فشل: `{bad}`", parse_mode="Markdown")
     return ConversationHandler.END
 
+def plan_label(plan):
+    ram = "غير محدود" if int(plan["memory"]) == 0 else f"{plan['memory']}MB"
+    disk = "غير محدود" if int(plan["disk"]) == 0 else f"{plan['disk']}MB"
+    cpu = "غير محدود" if int(plan["cpu"]) == 0 else f"{plan['cpu']}%"
+    return (f"📦 الاسم: {plan['name']}\n"
+            f"💳 الرسوم: {plan['points']} نقطة\n"
+            f"⏳ المدة: {plan['days']} يوم\n"
+            f"⚡ CPU: {cpu}\n"
+            f"🧠 RAM: {ram}\n"
+            f"💿 Disk: {disk}")
+
+def plans_menu_markup():
+    rows=[]
+    for key, plan in configured_plans().items():
+        rows.append([InlineKeyboardButton(f"📦 {plan['name']} • {plan['points']} نقطة", callback_data=f"adminplan_select_{key}")])
+    rows.append([InlineKeyboardButton("➕ إضافة خطة جديدة", callback_data="adminplan_new")])
+    return InlineKeyboardMarkup(rows)
+
+async def show_admin_plans(target, context, edit=False):
+    if not is_dev(target.from_user.id if hasattr(target, "from_user") else target.effective_user.id):
+        return
+    lines=["💰 **إدارة خطط الأسعار**\n", "اختر الخطة التي تريد تعديلها:"]
+    for key, plan in configured_plans().items():
+        lines.append(f"• **{plan['name']}** — {plan['points']} نقطة — {plan['days']} يوم")
+    text="\n".join(lines)
+    if edit:
+        await target.edit_message_text(text, parse_mode="Markdown", reply_markup=plans_menu_markup())
+    else:
+        await target.message.reply_text(text, parse_mode="Markdown", reply_markup=plans_menu_markup())
+
 async def admin_plans_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_dev(update.effective_user.id): return ConversationHandler.END
-    lines = ["💰 **خطط الأسعار الحالية**"]
-    for key, plan in configured_plans().items():
-        lines.append(f"{key}: {plan['name']} | {plan['points']} نقطة | {plan['days']} يوم | RAM {plan['memory']}MB | Disk {plan['disk']}MB | CPU {plan['cpu']}%")
-    lines.append("\nأرسل خطة أو عدة خطط، سطرًا لكل خطة بالصيغة:")
-    lines.append("`basic|Basic|100|7|1024|2048|100`")
-    lines.append("الترتيب: المفتاح | الاسم | النقاط | الأيام | RAM MB | Disk MB | CPU %")
-    lines.append("سيتم استبدال جميع الخطط بالقائمة الجديدة. /cancel للإلغاء.")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    await show_admin_plans(update, context)
+    return ASK_PLANS
+
+async def admin_plan_select_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_dev(update.effective_user.id): return ASK_PLANS
+    key=q.data[len("adminplan_select_"):]
+    plan=configured_plans().get(key)
+    if not plan:
+        await q.edit_message_text("❌ الخطة غير موجودة.")
+        return ASK_PLANS
+    context.user_data["plan_edit_key"]=key
+    kb=[
+        [InlineKeyboardButton("💳 تعديل سعر الخطة", callback_data="adminplan_field_points"), InlineKeyboardButton("✏️ تعديل اسم الخطة", callback_data="adminplan_field_name")],
+        [InlineKeyboardButton("🛠️ تعديل موارد الخطة", callback_data="adminplan_field_resources")],
+        [InlineKeyboardButton("📅 تعديل عدد أيام الخطة", callback_data="adminplan_field_days")],
+        [InlineKeyboardButton("🗑️ حذف الخطة", callback_data="adminplan_delete"), InlineKeyboardButton("🔙 رجوع للخطط", callback_data="adminplan_back")],
+    ]
+    await q.edit_message_text(f"💰 **تفاصيل الخطة: {plan['name']}**\n\n{plan_label(plan)}\n\nاختر الجزء المراد تعديله:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(kb))
+    return ASK_PLANS
+
+async def admin_plan_field_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_dev(update.effective_user.id): return ASK_PLANS
+    field=q.data[len("adminplan_field_"):]
+    key=context.user_data.get("plan_edit_key")
+    plan=configured_plans().get(key)
+    if not plan: await q.edit_message_text("❌ الخطة غير موجودة."); return ASK_PLANS
+    context.user_data["plan_edit_field"]=field
+    prompts={
+        "points":"💳 أرسل رسوم الخطة بالنقاط، مثال: `150`",
+        "name":"✏️ أرسل اسم الخطة الجديد، مثال: `Gold`",
+        "days":"📅 أرسل عدد الأيام، مثال: `30`",
+        "resources":"🛠️ أرسل الموارد بهذا الشكل:\n`RAM=2048 DISK=4096 CPU=150`\nاستخدم 0 لأي مورد غير محدود.",
+    }
+    await q.edit_message_text(f"الخطة الحالية: **{plan['name']}**\n\n{prompts[field]}\n\n/cancel للإلغاء", parse_mode="Markdown")
+    return ASK_PLAN_EDIT
+
+async def receive_plan_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_dev(update.effective_user.id): return ConversationHandler.END
+    key=context.user_data.get("plan_edit_key"); field=context.user_data.get("plan_edit_field")
+    plans=configured_plans(); plan=plans.get(key)
+    if not plan: await update.message.reply_text("❌ الخطة غير موجودة."); return ConversationHandler.END
+    text=update.message.text.strip()
+    try:
+        if field == "name":
+            if not text or len(text)>40: raise ValueError
+            plan["name"]=text
+        elif field == "points":
+            v=int(text); assert v>=0; plan["points"]=v
+        elif field == "days":
+            v=int(text); assert v>0; plan["days"]=v
+        elif field == "resources":
+            vals={k:int(v) for k,v in re.findall(r"(ram|disk|cpu)\s*=\s*(\d+)", text.lower())}
+            if set(vals) != {"ram","disk","cpu"} or any(v<0 for v in vals.values()): raise ValueError
+            plan["memory"],plan["disk"],plan["cpu"]=vals["ram"],vals["disk"],vals["cpu"]
+        else: raise ValueError
+    except (ValueError, AssertionError):
+        await update.message.reply_text("❌ القيمة غير صحيحة. استخدم الزر مرة أخرى وأرسل الصيغة المطلوبة.")
+        return ASK_PLAN_EDIT
+    set_setting("plans_json", json.dumps(plans, ensure_ascii=False, separators=(",", ":")))
+    await update.message.reply_text(f"✅ تم تحديث الخطة **{plan['name']}**\n\n{plan_label(plan)}", parse_mode="Markdown", reply_markup=plans_menu_markup())
+    return ASK_PLANS
+
+async def admin_plan_back_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_dev(update.effective_user.id): return ASK_PLANS
+    await show_admin_plans(q, context, edit=True)
+    return ASK_PLANS
+
+async def admin_plan_delete_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_dev(update.effective_user.id): return ASK_PLANS
+    key=context.user_data.get("plan_edit_key"); plans=configured_plans()
+    if key in plans: del plans[key]
+    if not plans:
+        await q.edit_message_text("❌ يجب إبقاء خطة واحدة على الأقل.")
+        return ASK_PLANS
+    set_setting("plans_json", json.dumps(plans, ensure_ascii=False, separators=(",", ":")))
+    await show_admin_plans(q, context, edit=True)
+    return ASK_PLANS
+
+async def admin_plan_new_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_dev(update.effective_user.id): return ASK_PLANS
+    context.user_data["plan_new"]=True
+    await q.edit_message_text("➕ أرسل الخطة الجديدة في رسالة واحدة بهذا الشكل:\n`starter|Starter|50|3|512|1024|75`\n\nالترتيب: المفتاح | الاسم | النقاط | الأيام | RAM MB | Disk MB | CPU %", parse_mode="Markdown")
     return ASK_PLANS
 
 async def receive_plans(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_dev(update.effective_user.id): return ConversationHandler.END
-    plans = {}
+    existing = configured_plans()
+    is_new = bool(context.user_data.pop("plan_new", False))
+    plans = {} if not is_new else dict(existing)
     errors = []
     for number, line in enumerate(update.message.text.splitlines(), 1):
         line = line.strip()
@@ -1177,7 +1289,14 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)]))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("plans", admin_plans_start), MessageHandler(filters.Regex("^💰 خطط الأسعار$"), admin_plans_start)],
-        states={ASK_PLANS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_plans)]},
+        states={ASK_PLANS: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, receive_plans),
+            CallbackQueryHandler(admin_plan_select_cb, pattern="^adminplan_select_"),
+            CallbackQueryHandler(admin_plan_field_cb, pattern="^adminplan_field_"),
+            CallbackQueryHandler(admin_plan_back_cb, pattern="^adminplan_back$"),
+            CallbackQueryHandler(admin_plan_delete_cb, pattern="^adminplan_delete$"),
+            CallbackQueryHandler(admin_plan_new_cb, pattern="^adminplan_new$")],
+            ASK_PLAN_EDIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_plan_edit)]},
         fallbacks=[CommandHandler("cancel", cancel)]))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("transfer", transfer_start), MessageHandler(filters.Regex("^💰 تحويل نقاط$"), transfer_start)],
