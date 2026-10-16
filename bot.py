@@ -84,8 +84,9 @@ def transfer_points(sender, receiver, amount):
     try:
         conn.execute("BEGIN IMMEDIATE")
         a=conn.execute("SELECT points FROM wallets WHERE telegram_id=?",(int(sender),)).fetchone()
+        recipient=conn.execute("SELECT telegram_id FROM users WHERE telegram_id=?",(int(receiver),)).fetchone()
+        if not recipient: conn.rollback(); return False,"recipient_not_found"
         if not a or int(a["points"]) < int(amount): conn.rollback(); return False,"insufficient"
-        conn.execute("INSERT OR IGNORE INTO wallets(telegram_id,points,updated_at) VALUES(?,?,?)",(int(receiver),0,datetime.now().isoformat()))
         for uid,delta in ((sender,-int(amount)),(receiver,int(amount))):
             conn.execute("UPDATE wallets SET points=points+?,updated_at=? WHERE telegram_id=?",(delta,datetime.now().isoformat(),int(uid)))
             conn.execute("INSERT INTO points_ledger(telegram_id,delta,kind,reference,created_at) VALUES(?,?,?,?,?)",(int(uid),delta,"transfer",str(sender),datetime.now().isoformat()))
@@ -507,59 +508,48 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def servers_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user)
     if is_dev(update.effective_user.id):
-        await _show_servers(update, 0)
-        return
-    ids = owned_server_ids(update.effective_user.id)
-    if not ids:
-        await update.message.reply_text("📭 لا توجد سيرفرات لك. استخدم /create للبدء.")
-        return
-    lines, kb = ["📋 **سيرفراتك:**\n"], []
-    for sid in sorted(ids):
-        srv, err = pt.get_server(sid)
-        if err or not srv: continue
-        a = srv["attributes"]; icon = "⛔" if a.get("suspended") else "✅"
-        lines.append(f"{icon} `{sid}` — {a['name']}")
-        kb.append([InlineKeyboardButton(f"⚙️ {a['name']}", callback_data=f"mng_{sid}"), InlineKeyboardButton("📄 بيانات", callback_data=f"data_{sid}")])
-    await update.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
-
-async def _show_servers(update, page=0):
-    res, err = pt.list_servers()
-    target = update.callback_query.message if update.callback_query else update.message
-    if err:
-        await target.reply_text(f"❌ {err}")
-        return
-    data = res.get("data", [])
-    if not data:
-        await target.reply_text("📭 لا توجد سيرفرات.")
-        return
-    PER = 8
-    start = page * PER
-    chunk = data[start:start + PER]
-    text = f"📋 **السيرفرات** ({len(data)}) — صفحة {page+1}\n\n"
-    kb = []
-    for s in chunk:
-        a = s["attributes"]
-        icon = "⛔" if a.get("suspended") else "✅"
-        text += f"{icon} `{a['id']}` — {a['name']}\n"
-        kb.append([InlineKeyboardButton(f"⚙️ {a['name']}", callback_data=f"mng_{a['id']}")])
-    nav = []
-    if page > 0:
-        nav.append(InlineKeyboardButton("⬅️", callback_data=f"pg_{page-1}"))
-    if start + PER < len(data):
-        nav.append(InlineKeyboardButton("➡️", callback_data=f"pg_{page+1}"))
-    if nav:
-        kb.append(nav)
-    if update.callback_query:
-        await update.callback_query.edit_message_text(text,
-            reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await _show_servers(update, 0, None)
     else:
-        await update.message.reply_text(text,
-            reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+        await _show_servers(update, 0, update.effective_user.id)
+
+async def _show_servers(update, page=0, owner_id=None):
+    target = update.callback_query.message if update.callback_query else update.message
+    if owner_id is None and not is_dev(update.effective_user.id):
+        owner_id = update.effective_user.id
+    if owner_id is None:
+        res, err = pt.list_servers()
+        if err:
+            await target.reply_text(f"❌ {err}"); return
+        data = res.get("data", [])
+    else:
+        data=[]
+        for sid in sorted(owned_server_ids(owner_id)):
+            srv, err = pt.get_server(sid)
+            if not err and srv:
+                data.append(srv)
+    if not data:
+        await target.reply_text("📭 لا توجد سيرفرات لك. استخدم /create للبدء." if owner_id else "📭 لا توجد سيرفرات.")
+        return
+    PER=8; start=page*PER; chunk=data[start:start+PER]
+    text=f"📋 **{'سيرفراتك' if owner_id else 'كل السيرفرات'}** ({len(data)}) — صفحة {page+1}\n\n"
+    kb=[]
+    for srv in chunk:
+        a=srv["attributes"]; icon="⛔" if a.get("suspended") else "✅"
+        text += f"{icon} `{a['id']}` — {a['name']}\n"
+        kb.append([InlineKeyboardButton(f"⚙️ {a['name']}", callback_data=f"mng_{a['id']}"), InlineKeyboardButton("📄 بيانات", callback_data=f"data_{a['id']}")])
+    nav=[]
+    if page>0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"pg_{page-1}"))
+    if start+PER<len(data): nav.append(InlineKeyboardButton("➡️", callback_data=f"pg_{page+1}"))
+    if nav: kb.append(nav)
+    markup=InlineKeyboardMarkup(kb)
+    if update.callback_query: await update.callback_query.edit_message_text(text,reply_markup=markup,parse_mode="Markdown")
+    else: await update.message.reply_text(text,reply_markup=markup,parse_mode="Markdown")
 
 async def paginate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await _show_servers(update, int(q.data.split("_")[1]))
+    owner_id = None if is_dev(update.effective_user.id) else update.effective_user.id
+    await _show_servers(update, int(q.data.split("_")[1]), owner_id)
 
 async def server_data_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q=update.callback_query; await q.answer()
@@ -757,7 +747,8 @@ async def confirm_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def back_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await _show_servers(update, 0)
+    owner_id = None if is_dev(update.effective_user.id) else update.effective_user.id
+    await _show_servers(update, 0, owner_id)
 
 async def chpass_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_dev(update.effective_user.id):
@@ -861,8 +852,10 @@ async def buy_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await create_start(update, context)
 
 async def finish_transfer(update, context, receiver, amount):
-    ok,_=transfer_points(update.effective_user.id,int(receiver),int(amount))
-    if not ok: await update.message.reply_text("❌ لا يوجد رصيد كافٍ أو البيانات غير صحيحة."); return ConversationHandler.END
+    ok,reason=transfer_points(update.effective_user.id,int(receiver),int(amount))
+    if not ok:
+        messages={"recipient_not_found":"❌ هذا المستخدم غير مسجل في البوت. اطلب منه الضغط على /start أولًا.","insufficient":"❌ رصيدك غير كافٍ.","invalid":"❌ أدخل عدد نقاط صحيحًا أكبر من صفر ولا تحوّل لنفسك."}
+        await update.message.reply_text(messages.get(reason,"❌ تعذر تنفيذ التحويل.")); return ConversationHandler.END
     await update.message.reply_text(f"✅ تم تحويل {amount} نقطة إلى المستخدم {receiver} وتسجيل العملية.")
     try: await context.bot.send_message(int(receiver),f"💰 استلمت {amount} نقطة من مستخدم آخر.")
     except Exception: pass
@@ -870,8 +863,9 @@ async def finish_transfer(update, context, receiver, amount):
 
 async def transfer_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     register_user(update.effective_user)
-    if len(context.args)==2:
-        try: return await finish_transfer(update,context,int(context.args[0]),int(context.args[1]))
+    args = context.args or []
+    if len(args)==2:
+        try: return await finish_transfer(update,context,int(args[0]),int(args[1]))
         except Exception: await update.message.reply_text("❌ البيانات غير صحيحة."); return ConversationHandler.END
     await update.message.reply_text("👤 أرسل Telegram ID المستلم:")
     return ASK_TRANSFER_USER
