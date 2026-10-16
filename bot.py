@@ -1284,51 +1284,51 @@ def main():
         entry_points=[CommandHandler("create", create_start),
                       MessageHandler(filters.Regex("^🖥️ إنشاء سيرفر$"), create_start)],
         states={CHOOSE_TYPE: [CallbackQueryHandler(choose_type, pattern="^(type_|plan_|cancel)")],
-                ENTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_email)],
+                ENTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_email)],
                 ADMIN_CHOOSE_TYPE: [CallbackQueryHandler(admin_choose_type, pattern="^admin_(type_|cancel)")],
                 ADMIN_CHOOSE_RAM: [CallbackQueryHandler(admin_choose_ram, pattern="^admin_(ram_|back_type)")],
                 ADMIN_CHOOSE_DISK: [CallbackQueryHandler(admin_choose_disk, pattern="^admin_(disk_|back_ram)")],
                 ADMIN_CHOOSE_CPU: [CallbackQueryHandler(admin_choose_cpu, pattern="^admin_(cpu_|back_disk)")],
-                ADMIN_ENTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_receive_email)]},
+                ADMIN_ENTER_EMAIL: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), admin_receive_email)]},
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^إلغاء جميع العمليات ❌$"), cancel_all_operations)]))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("broadcast", admin_broadcast_start), MessageHandler(filters.Regex("^📣 إذاعة$"), admin_broadcast_start)],
-        states={ASK_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_broadcast)]},
+        states={ASK_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_broadcast)]},
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^إلغاء جميع العمليات ❌$"), cancel_all_operations)]))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("freeplan", admin_plan_start), MessageHandler(filters.Regex("^⚙️ الخطة المجانية$"), admin_plan_start)],
-        states={ASK_PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_plan)]},
+        states={ASK_PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_plan)]},
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^إلغاء جميع العمليات ❌$"), cancel_all_operations)]))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("plans", admin_plans_start), MessageHandler(filters.Regex("^💰 خطط الأسعار$"), admin_plans_start)],
         states={ASK_PLANS: [
-            MessageHandler(filters.TEXT & ~filters.COMMAND, receive_plans),
+            MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_plans),
             CallbackQueryHandler(admin_plan_select_cb, pattern="^adminplan_select_"),
             CallbackQueryHandler(admin_plan_field_cb, pattern="^adminplan_field_"),
             CallbackQueryHandler(admin_plan_back_cb, pattern="^adminplan_back$"),
             CallbackQueryHandler(admin_plan_delete_cb, pattern="^adminplan_delete$"),
             CallbackQueryHandler(admin_plan_new_cb, pattern="^adminplan_new$")],
-            ASK_PLAN_EDIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_plan_edit)]},
+            ASK_PLAN_EDIT: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_plan_edit)]},
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^إلغاء جميع العمليات ❌$"), cancel_all_operations)]))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("transfer", transfer_start), MessageHandler(filters.Regex("^💰 تحويل نقاط$"), transfer_start)],
-        states={ASK_TRANSFER_USER:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_transfer_user)], ASK_TRANSFER_AMOUNT:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_transfer_amount)]},
+        states={ASK_TRANSFER_USER:[MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_transfer_user)], ASK_TRANSFER_AMOUNT:[MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_transfer_amount)]},
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^إلغاء جميع العمليات ❌$"), cancel_all_operations)]))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("gift", gift_start), MessageHandler(filters.Regex("^🎁 كود هدية$"), gift_start)],
-        states={ASK_GIFT_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_gift_code)], ASK_GIFT_SPEC:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_gift_spec)]},
+        states={ASK_GIFT_CODE:[MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_gift_code)], ASK_GIFT_SPEC:[MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_gift_spec)]},
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^إلغاء جميع العمليات ❌$"), cancel_all_operations)]))
     app.add_handler(CommandHandler("users", admin_users))
     app.add_handler(CallbackQueryHandler(admin_user_servers, pattern="^adm_user_"))
     app.add_handler(CallbackQueryHandler(admin_extend_cb, pattern="^adm_extend_"))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("chpass", chpass_cmd)],
-        states={ASK_EMAIL_FOR_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_email_for_pass)],
-                ASK_PASS_NEW: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_pass_new)]},
+        states={ASK_EMAIL_FOR_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_email_for_pass)],
+                ASK_PASS_NEW: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_pass_new)]},
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^إلغاء جميع العمليات ❌$"), cancel_all_operations)]))
     app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(server_action, pattern="^act_chpass_")],
-        states={ASK_NEW_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_pass)]},
+        states={ASK_NEW_PASS: [MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_new_pass)]},
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^إلغاء جميع العمليات ❌$"), cancel_all_operations)]))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
@@ -1342,7 +1342,7 @@ def main():
     app.add_handler(CommandHandler("profile", profile))
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("addcredits", add_credits_start), CommandHandler("add_credits", add_credits_start)],
-        states={ASK_CREDIT_USER:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_credit_user)], ASK_CREDIT_AMOUNT:[MessageHandler(filters.TEXT & ~filters.COMMAND, receive_credit_amount)]},
+        states={ASK_CREDIT_USER:[MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_credit_user)], ASK_CREDIT_AMOUNT:[MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex("^إلغاء جميع العمليات ❌$"), receive_credit_amount)]},
         fallbacks=[CommandHandler("cancel", cancel), MessageHandler(filters.Regex("^إلغاء جميع العمليات ❌$"), cancel_all_operations)]))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^إلغاء جميع العمليات ❌$"), cancel_all_operations))
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex("^(🖥️ إنشاء سيرفر|🛒 شراء بالنقاط|📋 سيرفراتي|👤 ملفي|💰 تحويل نقاط|🎁 كود هدية|✅ حالة البوت|💳 الاشتراك|📊 الإحصائيات|🗂️ كل السيرفرات|👥 المستخدمون|📣 إذاعة|⚙️ الخطة المجانية|⛔ إيقاف الكل|▶️ تشغيل الكل)$"), menu_router))
