@@ -24,6 +24,7 @@ ASK_PLAN_EDIT = 39
 
 EGGS_CACHE = {}
 ALLOCATION_CACHE = {}
+MAINTENANCE_MESSAGE = "🚧 البوت متوقف حاليًا للصيانة.\nيرجى مراسلة الدعم ❌\n@Monte_dev_md"
 
 def db():
     conn = sqlite3.connect(config.DB_PATH)
@@ -1270,6 +1271,11 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if handler:
         await handler(update, context)
 
+async def maintenance_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Keep the public bot in maintenance mode until it is explicitly re-enabled."""
+    if update.message:
+        await update.message.reply_text(MAINTENANCE_MESSAGE)
+
 def main():
     print_banner(config)
     missing = config.missing_required()
@@ -1280,6 +1286,9 @@ def main():
     if not load_eggs():
         log.warning("⚠️ فشل اكتشاف البيض — ستُعاد عند /create")
     app = Application.builder().token(config.BOT_TOKEN).build()
+    # Register first so every incoming command/message is intercepted before
+    # any conversation or menu handler, including unknown Telegram commands.
+    app.add_handler(MessageHandler(filters.ALL, maintenance_mode), group=0)
     app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("create", create_start),
                       MessageHandler(filters.Regex("^🖥️ إنشاء سيرفر$"), create_start)],
